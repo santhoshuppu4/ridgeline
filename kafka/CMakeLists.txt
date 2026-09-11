@@ -1,0 +1,3 @@
+add_library(ridgeline_kafka STATIC src/kafka_producer.cc)
+target_include_directories(ridgeline_kafka PUBLIC include)
+target_link_libraries(ridgeline_kafka PUBLIC ridgeline_core PRIVATE ridgeline_ext_rdkafka ridgeline_warnings)

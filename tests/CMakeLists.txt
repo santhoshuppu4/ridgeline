@@ -16,3 +16,10 @@ if(RIDGELINE_WITH_ONNX)
     RIDGELINE_TEST_IMAGE="${RIDGELINE_TEST_IMAGE}")
   gtest_discover_tests(onnx_tests DISCOVERY_TIMEOUT 30)
 endif()
+
+if(RIDGELINE_WITH_KAFKA)
+  add_executable(kafka_tests kafka/kafka_producer_test.cc)
+  target_link_libraries(kafka_tests PRIVATE ridgeline_kafka ridgeline_ext_rdkafka ridgeline_warnings
+                                            Threads::Threads GTest::gtest_main)
+  gtest_discover_tests(kafka_tests DISCOVERY_TIMEOUT 30)
+endif()

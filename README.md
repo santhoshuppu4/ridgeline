@@ -59,7 +59,8 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 1b-ii** — OpenCV video capture, ONNX Runtime CPU inference (YOLOX-nano, COCO classes), zero-copy frame ring, `ridgeline_edge` tool
 - [x] **Phase 1b-iii** — agent `--video` mode: real pipeline -> gRPC, shared `EdgePipeline` component
 - [x] **Phase 1c** — write-ahead log, crash replay, kill -9 chaos test with identity oracle, fuzzed record parser
-- [ ] **Phase 1d** — Kafka, DynamoDB shadow, Redis
+- [x] **Phase 1d-i** — Kafka event backbone: gateway publishes before ack, tested against librdkafka's real mock protocol, standalone mock-broker tool for Docker-free dev
+- [ ] **Phase 1d-ii** — DynamoDB device shadow, Redis hot state
 - [ ] **Phase 2** — device simulator, config reconciliation, benchmarks
 - [ ] **Phase 3** — mTLS device identity, multi-tenancy, rate limiting, signed OTA
 - [ ] **Phase 4** — weather fusion, alert engine, Terraform
@@ -90,6 +91,26 @@ See `context/adr/0005-onnx-runtime-cpu-inference.md`.
 ```
 
 See `context/adr/0006-agent-write-ahead-log.md`.
+
+## Phase 1d-i: Kafka event backbone
+
+```bash
+sudo apt-get install -y librdkafka-dev
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_WITH_KAFKA=ON
+cmake --build build
+ctest --test-dir build --output-on-failure     # runs against librdkafka's real in-process mock cluster
+./scripts/kafka_gateway_smoke_test.sh build    # real agent -> gateway -> Kafka, no Docker required
+```
+
+For a production-realistic run against actual Redpanda instead of the mock cluster:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d
+./build/gateway/ridgeline_gateway --listen=0.0.0.0:50051 --kafka-brokers=localhost:19092
+```
+
+See `context/adr/0007-kafka-event-backbone.md`, including a real use-after-free
+bug found and fixed while building this.
 
 ## Honesty notes
 

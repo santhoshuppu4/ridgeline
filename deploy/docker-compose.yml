@@ -1,14 +1,32 @@
+# Local stand-ins for cloud services. NOT needed for Phase 0/1a/1b.
+#   docker compose -f deploy/docker-compose.yml up -d
 services:
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:latest
-    command: [redpanda, start, --mode=dev-container, --smp=1,
-              --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092,
-              --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092]
-    ports: ["19092:19092"]
+    # Single listener, advertised address == the port Docker maps to the
+    # host. Simpler than a dual internal/external listener setup, which is
+    # only needed once another container on this same docker network also
+    # needs to reach Redpanda (nothing does yet).
+    command: >
+      redpanda start
+      --smp 1
+      --memory 1G
+      --reserve-memory 0M
+      --overprovisioned
+      --node-id 0
+      --check=false
+      --kafka-addr 0.0.0.0:19092
+      --advertise-kafka-addr localhost:19092
+    ports:
+      - "19092:19092"
+
   dynamodb:
     image: amazon/dynamodb-local:latest
     command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
-    ports: ["8000:8000"]
+    ports:
+      - "8000:8000"
+
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports:
+      - "6379:6379"

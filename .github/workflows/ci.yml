@@ -72,3 +72,21 @@ jobs:
         run: clang++ -std=c++20 -Icore/include -fsanitize=fuzzer,address,undefined -O1 tools/fuzz/wal_record_fuzzer.cc -o wal_record_fuzzer
       - name: Fuzz WAL record parser for 60s
         run: mkdir -p corpus && ./wal_record_fuzzer -max_total_time=60 corpus
+
+  kafka:
+    name: kafka
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          ./scripts/install-deps.sh
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends librdkafka-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_WITH_KAFKA=ON
+      - name: Build
+        run: cmake --build build
+      - name: Tests (mock Kafka cluster, real wire protocol)
+        run: ctest --test-dir build --output-on-failure
+      - name: End-to-end smoke test (agent -> gateway -> Kafka)
+        run: ./scripts/kafka_gateway_smoke_test.sh build

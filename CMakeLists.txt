@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(RIDGELINE_BUILD_NET "Build the gRPC agent and gateway (needs gRPC/protobuf)" ON)
 option(RIDGELINE_WITH_ONNX "Build ONNX Runtime inference + OpenCV video capture (Phase 1b-ii)" OFF)
+option(RIDGELINE_WITH_KAFKA "Build the Kafka event-backbone integration (Phase 1d-i)" OFF)
 set(RIDGELINE_SANITIZE "" CACHE STRING "Sanitizer build: '', 'address' (ASan+UBSan), or 'thread' (TSan)")
 
 include(cmake/Sanitizers.cmake)
@@ -22,6 +23,10 @@ if(RIDGELINE_WITH_ONNX AND RIDGELINE_SANITIZE STREQUAL "thread")
   message(FATAL_ERROR "RIDGELINE_WITH_ONNX is not supported with TSan: prebuilt ONNX Runtime is uninstrumented "
                       "and its thread pool produces false-positive race reports.")
 endif()
+if(RIDGELINE_WITH_KAFKA AND RIDGELINE_SANITIZE STREQUAL "thread")
+  message(FATAL_ERROR "RIDGELINE_WITH_KAFKA is not supported with TSan: the apt-packaged librdkafka is "
+                      "uninstrumented and its internal broker/IO threads produce false-positive race reports.")
+endif()
 
 # IMPORTANT ORDERING: cmake/Dependencies.cmake defines RIDGELINE_MODEL_PATH
 # (among other cache vars), which agent/CMakeLists.txt consumes to set the
@@ -33,11 +38,14 @@ endif()
 # ordering bugs like this produce no error at configure or build time, only
 # at runtime, which is exactly why this dependency is called out explicitly
 # here rather than left to be rediscovered.
-if(RIDGELINE_WITH_ONNX)
+if(RIDGELINE_WITH_ONNX OR RIDGELINE_WITH_KAFKA)
   include(cmake/Dependencies.cmake)
 endif()
 
 add_subdirectory(core)
+if(RIDGELINE_WITH_KAFKA)
+  add_subdirectory(kafka)
+endif()
 if(RIDGELINE_BUILD_NET)
   add_subdirectory(proto)
   add_subdirectory(agent)
@@ -46,6 +54,8 @@ endif()
 if(RIDGELINE_WITH_ONNX)
   add_subdirectory(inference)
   add_subdirectory(capture)
+endif()
+if(RIDGELINE_WITH_ONNX OR RIDGELINE_WITH_KAFKA)
   add_subdirectory(tools)
 endif()
 add_subdirectory(tests)

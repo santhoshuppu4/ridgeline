@@ -51,3 +51,16 @@ set(RIDGELINE_MODEL_PATH "${CMAKE_SOURCE_DIR}/third_party/models/yolox_nano.onnx
     CACHE FILEPATH "YOLOX ONNX model used by tests and tools")
 set(RIDGELINE_TEST_IMAGE "${CMAKE_SOURCE_DIR}/third_party/testdata/dog.jpg"
     CACHE FILEPATH "Reference image with known objects, used by detector tests")
+
+# librdkafka: apt package ships proper CMake-free headers/libs, found via
+# find_path/find_library rather than find_package (it has no CMake config).
+find_path(RIDGELINE_RDKAFKA_INCLUDE librdkafka/rdkafkacpp.h)
+find_library(RIDGELINE_RDKAFKA_LIB rdkafka++)
+find_library(RIDGELINE_RDKAFKA_C_LIB rdkafka)
+if(NOT RIDGELINE_RDKAFKA_INCLUDE OR NOT RIDGELINE_RDKAFKA_LIB)
+  message(FATAL_ERROR "librdkafka not found. Install: sudo apt-get install -y librdkafka-dev")
+endif()
+add_library(ridgeline_ext_rdkafka INTERFACE)
+target_include_directories(ridgeline_ext_rdkafka SYSTEM INTERFACE ${RIDGELINE_RDKAFKA_INCLUDE})
+target_link_libraries(ridgeline_ext_rdkafka INTERFACE ${RIDGELINE_RDKAFKA_LIB} ${RIDGELINE_RDKAFKA_C_LIB})
+message(STATUS "librdkafka: ${RIDGELINE_RDKAFKA_LIB}")
