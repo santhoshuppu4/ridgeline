@@ -1,3 +1,3 @@
-add_library(ridgeline_onnx STATIC src/onnx_cpu_detector.cc)
+add_library(ridgeline_onnx STATIC src/onnx_cpu_detector.cc src/edge_pipeline.cc)
 target_include_directories(ridgeline_onnx PUBLIC include)
-target_link_libraries(ridgeline_onnx PUBLIC ridgeline_core ridgeline_ext_onnxruntime PRIVATE ridgeline_warnings)
+target_link_libraries(ridgeline_onnx PUBLIC ridgeline_core ridgeline_ext_onnxruntime ridgeline_capture PRIVATE ridgeline_warnings)

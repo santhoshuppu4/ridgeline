@@ -5,3 +5,4 @@ compile_commands.json
 models/*.onnx
 data/
 third_party/
+ridgeline-state/

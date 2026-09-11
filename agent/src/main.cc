@@ -1,10 +1,28 @@
-// Ridgeline edge agent — Phase 0 networking + Phase 1 ring buffer, not yet wired together.
+// Ridgeline edge agent — Phase 1b-iii (real detection pipeline, optional) +
+// Phase 1c (write-ahead log durability).
 //
-// This still streams FAKE detections (no camera, no ring buffer use yet).
-// Your next step: replace the fake-detection generator below with a real
-// producer/consumer split using ridgeline::SpscRingBuffer<Frame, N> — a
-// capture "thread" pushes Frames in, an "inference thread" pops them, runs
-// K-of-N confirmation, and hands confirmed detections to this gRPC loop.
+// TWO SOURCES OF DETECTIONS, same downstream handling either way:
+//   --video=PATH   : real EdgePipeline (capture + ONNX inference + K-of-N),
+//                    only available when built with -DRIDGELINE_WITH_ONNX=ON.
+//   (no --video)   : synthetic fake-detection generator, same as Phase 0/1a.
+//                    Kept so scripts/smoke_test.sh needs neither OpenCV nor
+//                    ONNX Runtime -- it's testing gRPC transport + WAL
+//                    durability, not the inference stack.
+//
+// DURABILITY (Phase 1c): every DetectionEvent is written to a WAL BEFORE
+// being handed to the network. An in-memory `outbox` (all events not yet
+// acked, in seq order) is what actually gets written to the gRPC stream --
+// on startup it's pre-loaded from Wal::ReplayUnacked, and on every
+// reconnect the whole outbox is resent from the front. That's what closes
+// the gap Phase 0/1a had: a connection drop used to silently lose whatever
+// was in flight; now a drop (or a full process kill -9) loses nothing that
+// was successfully WAL-appended.
+//
+// See context/adr/0006-agent-write-ahead-log.md for the design rationale,
+// including the deliberate simplifications (a mutex around `outbox`, rather
+// than a lock-free structure -- outbox operations happen at event rate, not
+// frame rate, so the hot-path lock-free discipline used for frame_ring
+// elsewhere doesn't apply here).
 
 #include <grpcpp/grpcpp.h>
 
@@ -14,19 +32,31 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <filesystem>
+#include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "ridgeline/backoff.h"
 #include "ridgeline/time.h"
 #include "ridgeline/v1/ingest.grpc.pb.h"
+#include "ridgeline/wal.h"
+
+#ifdef RIDGELINE_HAVE_ONNX
+#include "ridgeline/edge_pipeline.h"
+#include "ridgeline/ring_buffer.h"
+#endif
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
+namespace fs = std::filesystem;
 
 std::atomic<bool> g_stop{false};
 void OnSignal(int) { g_stop.store(true); }
@@ -34,9 +64,30 @@ void OnSignal(int) { g_stop.store(true); }
 struct Options {
   std::string gateway = "localhost:50051";
   std::string device_id = "cam-0001";
-  double rate_hz = 5.0;
+  double rate_hz = 5.0;          // Fake-detection mode only.
   int duration_s = 0;
+  std::string state_dir;         // Default derived from device_id below.
+  bool log_commits = false;      // Test oracle: print each event's identity once it is durably in the WAL.
+#ifdef RIDGELINE_HAVE_ONNX
+  std::string video;
+  std::string model = RIDGELINE_DEFAULT_MODEL;
+  std::vector<int> classes;
+  std::uint32_t k = 3, n = 5;
+  int threads = 1;
+  float score = 0.3f;
+  bool loop = false;
+#endif
 };
+
+#ifdef RIDGELINE_HAVE_ONNX
+std::vector<int> ParseClassList(const char* s) {
+  std::vector<int> out;
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, ',')) if (!item.empty()) out.push_back(std::atoi(item.c_str()));
+  return out;
+}
+#endif
 
 Options ParseArgs(int argc, char** argv) {
   Options opt;
@@ -49,9 +100,22 @@ Options ParseArgs(int argc, char** argv) {
     else if (auto v2 = value("--device-id=")) opt.device_id = v2;
     else if (auto v3 = value("--rate-hz=")) opt.rate_hz = std::atof(v3);
     else if (auto v4 = value("--duration-s=")) opt.duration_s = std::atoi(v4);
+    else if (auto v5 = value("--state-dir=")) opt.state_dir = v5;
+    else if (arg == "--log-commits") opt.log_commits = true;
+#ifdef RIDGELINE_HAVE_ONNX
+    else if (auto v6 = value("--video=")) opt.video = v6;
+    else if (auto v7 = value("--model=")) opt.model = v7;
+    else if (auto v8 = value("--classes=")) opt.classes = ParseClassList(v8);
+    else if (auto v9 = value("--k=")) opt.k = static_cast<std::uint32_t>(std::atoi(v9));
+    else if (auto v10 = value("--n=")) opt.n = static_cast<std::uint32_t>(std::atoi(v10));
+    else if (auto v11 = value("--threads=")) opt.threads = std::atoi(v11);
+    else if (auto v12 = value("--score=")) opt.score = static_cast<float>(std::atof(v12));
+    else if (arg == "--loop") opt.loop = true;
+#endif
     else { std::fprintf(stderr, "unknown argument: %s\n", argv[i]); std::exit(2); }
   }
   if (opt.rate_hz <= 0.0) { std::fprintf(stderr, "--rate-hz must be > 0\n"); std::exit(2); }
+  if (opt.state_dir.empty()) opt.state_dir = "ridgeline-state/" + opt.device_id;
   return opt;
 }
 
@@ -74,6 +138,33 @@ bool WaitForConnection(grpc::Channel& channel, Clock::duration timeout) {
   return false;
 }
 
+// All events not yet acked, in ascending seq order. Protected by a mutex --
+// see the file-level comment on why this one piece of state isn't lock-free
+// like frame_ring/events elsewhere in the pipeline.
+class Outbox {
+ public:
+  void Push(std::uint64_t seq, std::string bytes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    items_.push_back({seq, std::move(bytes)});
+  }
+  void AckUpTo(std::uint64_t up_to_seq) {
+    std::lock_guard<std::mutex> lock(mu_);
+    while (!items_.empty() && items_.front().first <= up_to_seq) items_.pop_front();
+  }
+  // Snapshot for resending on (re)connect. Copies rather than holding the
+  // lock across gRPC I/O, since Push()/AckUpTo() must never block on a
+  // slow/stuck network write.
+  std::vector<std::pair<std::uint64_t, std::string>> Snapshot() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return {items_.begin(), items_.end()};
+  }
+  std::size_t Size() const { std::lock_guard<std::mutex> lock(mu_); return items_.size(); }
+
+ private:
+  mutable std::mutex mu_;
+  std::deque<std::pair<std::uint64_t, std::string>> items_;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -81,17 +172,121 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
 
+  std::error_code ec;
+  fs::create_directories(opt.state_dir, ec);
+  if (ec) { std::fprintf(stderr, "[agent] could not create state dir %s: %s\n", opt.state_dir.c_str(), ec.message().c_str()); return 1; }
+
+  ridgeline::Wal wal((fs::path(opt.state_dir) / "events.wal").string(), (fs::path(opt.state_dir) / "events.ckpt").string());
+
+  Outbox outbox;
+  std::uint64_t next_seq = wal.LastAcked() + 1;
+  {
+    std::uint64_t max_replayed = wal.LastAcked();
+    const std::size_t n = wal.ReplayUnacked([&](std::uint64_t seq, const std::string& bytes) {
+      outbox.Push(seq, bytes);
+      max_replayed = std::max(max_replayed, seq);
+    });
+    next_seq = max_replayed + 1;
+    if (n > 0) std::fprintf(stderr, "[agent] replayed %zu unacked event(s) from WAL, resuming at seq=%llu\n", n,
+                            static_cast<unsigned long long>(next_seq));
+  }
+
   const auto started = Clock::now();
   auto time_up = [&] { return opt.duration_s > 0 && Clock::now() - started >= std::chrono::seconds{opt.duration_s}; };
 
-  std::mt19937_64 rng{std::random_device{}()};
-  std::uniform_real_distribution<double> unit{0.0, 1.0};
-  std::uniform_real_distribution<float> conf{0.40f, 0.95f};
+  std::atomic<std::uint64_t> queue_depth{0};
+  std::atomic<std::uint64_t> frames_dropped{0};
+
+  std::thread producer;
+  std::atomic<bool> producer_done{false};
+
+  auto emit = [&](ridgeline::v1::DetectionEvent&& d) {
+    d.set_seq(next_seq);
+    const std::string bytes = d.SerializeAsString();
+    wal.Append(next_seq, bytes);
+    outbox.Push(next_seq, bytes);
+    if (opt.log_commits) {
+      // Printed only after Append() has fsync'd: from this line on, the event
+      // is a promise. stderr is unbuffered, so the line survives kill -9.
+      // scripts/chaos_test.sh checks every such promise against what the
+      // gateway actually received, by (seq, capture_time) identity.
+      std::fprintf(stderr, "[commit] seq=%llu capture_ns=%lld\n", static_cast<unsigned long long>(next_seq),
+                   static_cast<long long>(d.capture_time_unix_ns()));
+    }
+    ++next_seq;
+  };
+
+#ifdef RIDGELINE_HAVE_ONNX
+  if (!opt.video.empty()) {
+    producer = std::thread([&] {
+      ridgeline::EdgePipelineConfig config;
+      config.video_path = opt.video;
+      config.model_path = opt.model;
+      config.target_class_ids = opt.classes;
+      config.k = opt.k;
+      config.n = opt.n;
+      config.intra_op_threads = opt.threads;
+      config.score_threshold = opt.score;
+      config.realtime = true;
+      config.loop = opt.loop;
+
+      ridgeline::SpscRingBuffer<ridgeline::ConfirmedEvent, 256> events;
+      ridgeline::EdgePipeline pipeline(config, events);
+      ridgeline::ConfirmedEvent ev;
+      while (!g_stop.load() && !time_up() && (!pipeline.Finished() || events.SizeApprox() > 0)) {
+        queue_depth.store(pipeline.FrameQueueDepth(), std::memory_order_relaxed);
+        frames_dropped.store(pipeline.FramesDropped(), std::memory_order_relaxed);
+        if (events.TryPop(ev)) {
+          ridgeline::v1::DetectionEvent d;
+          d.set_label("smoke");
+          d.set_confidence(ev.confidence);
+          auto* box = d.mutable_bbox();
+          box->set_x_min(ev.x_min); box->set_y_min(ev.y_min); box->set_x_max(ev.x_max); box->set_y_max(ev.y_max);
+          d.set_capture_time_unix_ns(ev.capture_time_unix_ns);
+          d.set_emit_time_unix_ns(ridgeline::NowUnixNs());
+          d.set_frames_confirmed(ev.frames_confirmed);
+          d.set_window_size(ev.window_size);
+          emit(std::move(d));
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+      }
+      producer_done.store(true, std::memory_order_release);
+    });
+  }
+#endif
+  if (
+#ifdef RIDGELINE_HAVE_ONNX
+      opt.video.empty()
+#else
+      true
+#endif
+  ) {
+    producer = std::thread([&] {
+      std::mt19937_64 rng{std::random_device{}()};
+      std::uniform_real_distribution<float> conf{0.40f, 0.95f};
+      const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>{1.0 / opt.rate_hz});
+      auto next_due = Clock::now();
+      while (!g_stop.load() && !time_up()) {
+        ridgeline::v1::DetectionEvent d;
+        d.set_label("smoke");
+        d.set_confidence(conf(rng));
+        auto* box = d.mutable_bbox();
+        box->set_x_min(0.40f); box->set_y_min(0.30f); box->set_x_max(0.55f); box->set_y_max(0.42f);
+        const auto ts = ridgeline::NowUnixNs();
+        d.set_capture_time_unix_ns(ts);
+        d.set_emit_time_unix_ns(ts);
+        emit(std::move(d));
+        next_due += period;
+        if (next_due > Clock::now()) std::this_thread::sleep_for(std::min<Clock::duration>(next_due - Clock::now(), 50ms));
+      }
+      producer_done.store(true, std::memory_order_release);
+    });
+  }
 
   const ridgeline::BackoffPolicy backoff;
   std::uint32_t attempt = 0;
-  std::uint64_t next_seq = 1;
-  std::atomic<std::uint64_t> last_acked{0};
+  std::uint64_t bytes_since_compact = 0;
 
   grpc::ChannelArguments channel_args;
   channel_args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, static_cast<int>(backoff.base.count()));
@@ -100,12 +295,26 @@ int main(int argc, char** argv) {
   auto channel = grpc::CreateCustomChannel(opt.gateway, grpc::InsecureChannelCredentials(), channel_args);
   auto stub = ridgeline::v1::IngestService::NewStub(channel);
 
-  const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>{1.0 / opt.rate_hz});
+  std::mt19937_64 jitter_rng{std::random_device{}()};
+  std::uniform_real_distribution<double> unit{0.0, 1.0};
 
-  while (!g_stop.load() && !time_up()) {
+  auto producer_finished = [&] { return producer_done.load(std::memory_order_acquire); };
+  // Exit once the producer has no more to give us (time limit reached in
+  // fake mode, or the video source is exhausted in --video mode) AND
+  // everything has been acked. An earlier version required time_up() AND
+  // producer_finished() together, which meant --video mode without an
+  // explicit --duration-s (the normal case: the agent should just process
+  // the whole video and stop) never exited at all -- time_up() is always
+  // false when duration_s == 0, so the exit condition could never become
+  // true even after the video ended and every event was acked. Caught by
+  // scripts/smoke_test_video.sh hanging until its own timeout wrapper
+  // killed it, rather than by any assertion actually failing -- a reminder
+  // that "the test hung" is itself a test result worth paying attention to.
+
+  while (!g_stop.load() && !((time_up() || producer_finished()) && outbox.Size() == 0)) {
     if (!WaitForConnection(*channel, kConnectTimeout)) {
-      if (g_stop.load() || time_up()) break;
-      const auto delay = ridgeline::FullJitterBackoff(attempt, backoff, unit(rng));
+      if (g_stop.load()) break;
+      const auto delay = ridgeline::FullJitterBackoff(attempt, backoff, unit(jitter_rng));
       ++attempt;
       std::fprintf(stderr, "[agent] gateway %s unreachable, retrying in %lld ms\n", opt.gateway.c_str(),
                    static_cast<long long>(delay.count()));
@@ -115,15 +324,15 @@ int main(int argc, char** argv) {
 
     grpc::ClientContext ctx;
     auto stream = stub->Connect(&ctx);
-
+    std::uint64_t last_sent_seq = 0;  // Reset per connection: outbox already holds only unacked items,
+                                       // so a fresh connection always resends everything outstanding.
     std::atomic<bool> got_ack{false};
     std::thread reader([&] {
       ridgeline::v1::GatewayMessage msg;
       while (stream->Read(&msg)) {
         if (msg.has_ack()) {
-          const std::uint64_t acked = msg.ack().up_to_seq();
-          std::uint64_t prev = last_acked.load();
-          while (acked > prev && !last_acked.compare_exchange_weak(prev, acked)) {}
+          outbox.AckUpTo(msg.ack().up_to_seq());
+          wal.Acknowledge(msg.ack().up_to_seq());
           got_ack.store(true);
         }
       }
@@ -133,58 +342,81 @@ int main(int argc, char** argv) {
     auto* hello = hello_msg.mutable_hello();
     hello->set_device_id(opt.device_id);
     hello->set_agent_version(RIDGELINE_VERSION);
-    hello->set_last_acked_seq(last_acked.load());
+    hello->set_last_acked_seq(wal.LastAcked());
     bool ok = stream->Write(hello_msg);
 
-    auto next_detection = Clock::now();
-    auto next_heartbeat = Clock::now();
-    while (ok && !g_stop.load() && !time_up()) {
-      const auto now = Clock::now();
-      if (now >= next_detection) {
+    if (ok) {
+      for (const auto& kv : outbox.Snapshot()) {
         ridgeline::v1::AgentMessage m;
-        auto* d = m.mutable_detection();
-        d->set_seq(next_seq);
-        d->set_label("smoke");
-        d->set_confidence(conf(rng));
-        auto* box = d->mutable_bbox();
-        box->set_x_min(0.40f); box->set_y_min(0.30f); box->set_x_max(0.55f); box->set_y_max(0.42f);
-        const auto ts = ridgeline::NowUnixNs();
-        d->set_capture_time_unix_ns(ts);
-        d->set_emit_time_unix_ns(ts);
+        m.mutable_detection()->ParseFromString(kv.second);
         ok = stream->Write(m);
-        if (ok) ++next_seq;
-        next_detection += period;
+        if (!ok) break;
+        last_sent_seq = std::max(last_sent_seq, kv.first);
       }
+    }
+
+    auto next_heartbeat = Clock::now();
+    while (ok && !g_stop.load() && !((time_up() || producer_finished()) && outbox.Size() == 0)) {
+      const auto now = Clock::now();
+
+      // Send anything with seq > last_sent_seq. Tracking by SEQ, not by
+      // outbox index/size, is the point: acks concurrently pop_front old
+      // entries out of the outbox while the producer appends new ones to
+      // the back, so the deque's size shrinks and grows independently of
+      // "how many items have been sent." An earlier version compared
+      // outbox.Size() across passes and, whenever an ack popped entries
+      // between passes, either skipped resending genuinely-new events or
+      // resent already-sent ones out of the gateway's expected order --
+      // the smoke test caught this directly as gateway-reported sequence
+      // gaps (`lost=N` in its disconnect summary) even though the agent
+      // itself believed everything was eventually acked. Seq numbers are
+      // stable identities; indices into a mutating deque are not.
+      for (const auto& kv : outbox.Snapshot()) {
+        if (kv.first <= last_sent_seq) continue;
+        ridgeline::v1::AgentMessage m;
+        m.mutable_detection()->ParseFromString(kv.second);
+        ok = stream->Write(m);
+        if (!ok) break;
+        last_sent_seq = std::max(last_sent_seq, kv.first);
+      }
+
       if (ok && now >= next_heartbeat) {
         ridgeline::v1::AgentMessage m;
-        m.mutable_heartbeat()->set_sent_time_unix_ns(ridgeline::NowUnixNs());
+        auto* hb = m.mutable_heartbeat();
+        hb->set_sent_time_unix_ns(ridgeline::NowUnixNs());
+        hb->set_queue_depth(static_cast<std::uint32_t>(queue_depth.load(std::memory_order_relaxed)));
+        hb->set_frames_dropped(frames_dropped.load(std::memory_order_relaxed));
         ok = stream->Write(m);
         next_heartbeat += 1s;
       }
-      const auto wake = std::min(next_detection, next_heartbeat);
-      if (wake > Clock::now()) std::this_thread::sleep_for(std::min<Clock::duration>(wake - Clock::now(), 50ms));
+      if (!ok) break;
+      std::this_thread::sleep_for(20ms);
+
+      if (wal.FileSizeBytes() > bytes_since_compact + (1u << 20)) {
+        wal.Compact();
+        bytes_since_compact = wal.FileSizeBytes();
+      }
     }
 
     if (ok) stream->WritesDone(); else ctx.TryCancel();
     reader.join();
     const grpc::Status status = stream->Finish();
-
-    const std::uint64_t unacked = (next_seq - 1) - std::min(last_acked.load(), next_seq - 1);
-    if (g_stop.load() || time_up()) break;
+    if (g_stop.load()) break;
 
     if (got_ack.load()) attempt = 0;
-    const auto delay = ridgeline::FullJitterBackoff(attempt, backoff, unit(rng));
+    const auto delay = ridgeline::FullJitterBackoff(attempt, backoff, unit(jitter_rng));
     ++attempt;
-    std::fprintf(stderr, "[agent] stream ended (code=%d: %s), %llu unacked, retrying in %lld ms\n",
-                 static_cast<int>(status.error_code()), status.error_message().c_str(),
-                 static_cast<unsigned long long>(unacked), static_cast<long long>(delay.count()));
+    std::fprintf(stderr, "[agent] stream ended (code=%d: %s), %zu unacked, retrying in %lld ms\n",
+                 static_cast<int>(status.error_code()), status.error_message().c_str(), outbox.Size(),
+                 static_cast<long long>(delay.count()));
     SleepInterruptibly(delay);
   }
 
-  const std::uint64_t sent = next_seq - 1;
-  const std::uint64_t acked = last_acked.load();
-  std::fprintf(stderr, "[agent] done: sent=%llu acked=%llu\n", static_cast<unsigned long long>(sent),
-               static_cast<unsigned long long>(acked));
-  if (opt.duration_s > 0 && (sent == 0 || acked != sent)) return 1;
+  g_stop.store(true);
+  if (producer.joinable()) producer.join();
+
+  std::fprintf(stderr, "[agent] done: next_seq=%llu last_acked=%llu unacked=%zu\n",
+               static_cast<unsigned long long>(next_seq - 1), static_cast<unsigned long long>(wal.LastAcked()), outbox.Size());
+  if (opt.duration_s > 0 && outbox.Size() != 0) return 1;
   return 0;
 }

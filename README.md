@@ -57,8 +57,8 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 1a** — lock-free SPSC ring buffer + arena-backed Frame, tested under ASan/UBSan/TSan
 - [x] **Phase 1b-i** — K-of-N confirmation, detector interface, synthetic capture pipeline
 - [x] **Phase 1b-ii** — OpenCV video capture, ONNX Runtime CPU inference (YOLOX-nano, COCO classes), zero-copy frame ring, `ridgeline_edge` tool
-- [ ] **Phase 1b-iii** — feed confirmed events from the edge pipeline into the agent's gRPC stream
-- [ ] **Phase 1c** — write-ahead log + replay across agent restarts
+- [x] **Phase 1b-iii** — agent `--video` mode: real pipeline -> gRPC, shared `EdgePipeline` component
+- [x] **Phase 1c** — write-ahead log, crash replay, kill -9 chaos test with identity oracle, fuzzed record parser
 - [ ] **Phase 1d** — Kafka, DynamoDB shadow, Redis
 - [ ] **Phase 2** — device simulator, config reconciliation, benchmarks
 - [ ] **Phase 3** — mTLS device identity, multi-tenancy, rate limiting, signed OTA
@@ -79,6 +79,17 @@ ctest --test-dir build --output-on-failure
 
 The stock model detects COCO classes (person, car, dog, ...), **not smoke**.
 See `context/adr/0005-onnx-runtime-cpu-inference.md`.
+
+## Phase 1b-iii / 1c: durable delivery
+
+```bash
+./scripts/smoke_test.sh build          # gateway outage: 0 lost, 0 duplicates
+./scripts/chaos_test.sh build          # kill -9 agent holding WAL-only events: all delivered
+./build/tools/ridgeline_make_sample_video
+./scripts/smoke_test_video.sh build    # real video -> ONNX -> gRPC: exactly 4 events (needs -DRIDGELINE_WITH_ONNX=ON)
+```
+
+See `context/adr/0006-agent-write-ahead-log.md`.
 
 ## Honesty notes
 

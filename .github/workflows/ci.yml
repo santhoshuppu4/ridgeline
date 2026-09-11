@@ -27,6 +27,9 @@ jobs:
       - name: End-to-end smoke test
         if: matrix.net == 'ON'
         run: ./scripts/smoke_test.sh build
+      - name: Chaos test (kill -9 agent, verify WAL durability)
+        if: matrix.net == 'ON'
+        run: ./scripts/chaos_test.sh build
 
   # Phase 1b-ii: real ONNX Runtime inference + OpenCV video decode.
   # Separate job because it downloads ~12MB of pinned, checksum-verified
@@ -48,8 +51,24 @@ jobs:
       - name: Fetch and verify assets
         run: ./scripts/fetch-phase1b-assets.sh
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_BUILD_NET=OFF -DRIDGELINE_WITH_ONNX=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_WITH_ONNX=ON
       - name: Build
         run: cmake --build build
       - name: Tests (core + real inference)
         run: ctest --test-dir build --output-on-failure
+      - name: Video smoke test (real inference through gRPC)
+        run: |
+          ./build/tools/ridgeline_make_sample_video
+          ./scripts/smoke_test_video.sh build
+
+  fuzz-wal:
+    name: fuzz-wal
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build fuzzer
+        run: clang++ -std=c++20 -Icore/include -fsanitize=fuzzer,address,undefined -O1 tools/fuzz/wal_record_fuzzer.cc -o wal_record_fuzzer
+      - name: Fuzz WAL record parser for 60s
+        run: mkdir -p corpus && ./wal_record_fuzzer -max_total_time=60 corpus

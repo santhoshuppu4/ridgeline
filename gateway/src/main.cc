@@ -17,6 +17,7 @@ using ridgeline::v1::AgentMessage;
 using ridgeline::v1::GatewayMessage;
 std::atomic<bool> g_stop{false};
 void OnSignal(int) { g_stop.store(true); }
+bool g_log_events = false;  // Test oracle output; see scripts/chaos_test.sh.
 
 class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
  public:
@@ -37,6 +38,10 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
         case AgentMessage::kDetection: {
           if (device_id.empty()) return {grpc::StatusCode::FAILED_PRECONDITION, "hello must be first"};
           const auto& d = msg.detection();
+          if (g_log_events) {
+            std::fprintf(stderr, "[recv] device=%s seq=%llu capture_ns=%lld\n", device_id.c_str(),
+                         static_cast<unsigned long long>(d.seq()), static_cast<long long>(d.capture_time_unix_ns()));
+          }
           if (d.seq() <= last_seq) { ++duplicates; }
           else {
             if (d.seq() != last_seq + 1) gap_events += d.seq() - last_seq - 1;
@@ -68,6 +73,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string_view arg{argv[i]};
     if (arg.rfind("--listen=", 0) == 0) listen = std::string{arg.substr(9)};
+    else if (arg == "--log-events") g_log_events = true;
     else { std::fprintf(stderr, "unknown argument: %s\n", argv[i]); return 2; }
   }
   std::signal(SIGINT, OnSignal); std::signal(SIGTERM, OnSignal);
