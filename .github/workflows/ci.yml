@@ -1,0 +1,29 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: release,     build_type: Release, sanitize: "",      net: "ON"}
+          - {name: asan-ubsan,  build_type: Debug,   sanitize: address, net: "ON"}
+          - {name: tsan-core,   build_type: Debug,   sanitize: thread,  net: "OFF"}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: ./scripts/install-deps.sh
+      - name: Lower ASLR entropy for TSan
+        if: matrix.sanitize == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DRIDGELINE_SANITIZE=${{ matrix.sanitize }} -DRIDGELINE_BUILD_NET=${{ matrix.net }}
+      - name: Build
+        run: cmake --build build
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: End-to-end smoke test
+        if: matrix.net == 'ON'
+        run: ./scripts/smoke_test.sh build

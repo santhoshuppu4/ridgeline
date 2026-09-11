@@ -1,0 +1,2 @@
+add_executable(ridgeline_gateway src/main.cc)
+target_link_libraries(ridgeline_gateway PRIVATE ridgeline_core ridgeline_proto ridgeline_warnings Threads::Threads)

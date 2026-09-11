@@ -1,0 +1,45 @@
+syntax = "proto3";
+package ridgeline.v1;
+
+message BoundingBox { float x_min = 1; float y_min = 2; float x_max = 3; float y_max = 4; }
+
+message Hello {
+  string device_id = 1;
+  string agent_version = 2;
+  uint64 last_acked_seq = 3;
+}
+
+message DetectionEvent {
+  uint64 seq = 1;
+  string label = 2;
+  float confidence = 3;
+  BoundingBox bbox = 4;
+  int64 capture_time_unix_ns = 5;
+  int64 emit_time_unix_ns = 6;
+  uint32 frames_confirmed = 7;
+  uint32 window_size = 8;
+}
+
+message Heartbeat {
+  int64 sent_time_unix_ns = 1;
+  uint32 queue_depth = 2;
+  uint64 frames_dropped = 3;
+}
+
+message AgentMessage {
+  oneof payload { Hello hello = 1; DetectionEvent detection = 2; Heartbeat heartbeat = 3; }
+}
+
+message Ack { uint64 up_to_seq = 1; }
+message ConfigUpdate {
+  uint64 version = 1;
+  float confidence_threshold = 2;
+  uint32 confirm_k = 3;
+  uint32 confirm_n = 4;
+  uint32 target_fps = 5;
+}
+message GatewayMessage { oneof payload { Ack ack = 1; ConfigUpdate config = 2; } }
+
+service IngestService {
+  rpc Connect(stream AgentMessage) returns (stream GatewayMessage);
+}
