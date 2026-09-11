@@ -1,0 +1,13 @@
+add_executable(ridgeline_edge ridgeline_edge.cc)
+target_link_libraries(ridgeline_edge PRIVATE ridgeline_onnx ridgeline_capture ridgeline_warnings Threads::Threads)
+target_compile_definitions(ridgeline_edge PRIVATE RIDGELINE_DEFAULT_MODEL="${RIDGELINE_MODEL_PATH}")
+
+add_executable(ridgeline_infer_bench infer_bench.cc)
+target_link_libraries(ridgeline_infer_bench PRIVATE ridgeline_onnx ridgeline_ext_opencv ridgeline_warnings)
+target_compile_definitions(ridgeline_infer_bench PRIVATE
+  RIDGELINE_DEFAULT_MODEL="${RIDGELINE_MODEL_PATH}"
+  RIDGELINE_DEFAULT_IMAGE="${RIDGELINE_TEST_IMAGE}")
+
+add_executable(ridgeline_make_sample_video make_sample_video.cc)
+target_link_libraries(ridgeline_make_sample_video PRIVATE ridgeline_ext_opencv ridgeline_warnings)
+target_compile_definitions(ridgeline_make_sample_video PRIVATE RIDGELINE_DEFAULT_IMAGE="${RIDGELINE_TEST_IMAGE}")

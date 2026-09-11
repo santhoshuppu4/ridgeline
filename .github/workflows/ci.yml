@@ -27,3 +27,29 @@ jobs:
       - name: End-to-end smoke test
         if: matrix.net == 'ON'
         run: ./scripts/smoke_test.sh build
+
+  # Phase 1b-ii: real ONNX Runtime inference + OpenCV video decode.
+  # Separate job because it downloads ~12MB of pinned, checksum-verified
+  # assets and installs OpenCV, which the core jobs don't need.
+  onnx-inference:
+    name: onnx-inference
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          ./scripts/install-deps.sh
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libopencv-dev
+      - name: Cache third_party assets
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: phase1b-assets-${{ hashFiles('scripts/fetch-phase1b-assets.sh') }}
+      - name: Fetch and verify assets
+        run: ./scripts/fetch-phase1b-assets.sh
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_BUILD_NET=OFF -DRIDGELINE_WITH_ONNX=ON
+      - name: Build
+        run: cmake --build build
+      - name: Tests (core + real inference)
+        run: ctest --test-dir build --output-on-failure

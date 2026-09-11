@@ -4,3 +4,4 @@ compile_commands.json
 *.log
 models/*.onnx
 data/
+third_party/

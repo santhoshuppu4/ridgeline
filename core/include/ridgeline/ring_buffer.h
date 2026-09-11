@@ -190,6 +190,71 @@ class SpscRingBuffer {
     return true;
   }
 
+  // ---------------------------------------------------------------------------
+  // ZERO-COPY API (added in Phase 1b-ii).
+  //
+  // WHY THIS EXISTS: TryPush(T item) takes its argument BY VALUE and then
+  // move-assigns it into the slot. For an int that's free. For a Frame
+  // holding a 1280x720 BGR image inline (~2.6MB of std::array), "move" is a
+  // full copy — so every frame paid two 2.6MB memcpys (into the parameter,
+  // then into the slot), plus 2.6MB of stack for the parameter itself. That
+  // defeats the whole "arena" idea: the slot memory already exists, so the
+  // producer should write the pixels straight into it.
+  //
+  // TryPushWith(fill): calls fill(T& slot) on the next free slot IN PLACE,
+  // and only publishes it (advances tail_) if fill returns true. If fill
+  // returns false (e.g. the video decoder hit end-of-file), nothing is
+  // published and the slot is simply reused next time.
+  //
+  // TryPopWith(consume): calls consume(T& slot) on the oldest slot IN PLACE,
+  // then frees it (advances head_) after consume returns.
+  //
+  // WHY THIS IS STILL SAFE WITHOUT A LOCK — same argument as TryPush/TryPop,
+  // just with the write/read happening inside a callback:
+  //   - The producer only touches slots_[tail], and only BEFORE publishing
+  //     the new tail_. Until tail_ advances, the consumer considers that slot
+  //     empty and will never read it.
+  //   - The consumer only touches slots_[head], and only AFTER seeing a
+  //     tail_ that includes it and BEFORE publishing the new head_. Until
+  //     head_ advances, the producer considers that slot full and will never
+  //     write it (the "next_tail == head" full check).
+  // So each slot has exactly one owner at any moment, and ownership is handed
+  // across by a single atomic store. TSan-verified in
+  // tests/ring_buffer_test.cc (RingBufferZeroCopy.* stress test).
+  //
+  // Contract: callbacks must not throw (the project builds without relying
+  // on exceptions on the hot path) and must not call back into this ring
+  // buffer. Keep them short — the consumer's callback runs while that slot is
+  // still "occupied," so a slow consume() makes the buffer look fuller to the
+  // producer, which is exactly the backpressure ADR-0003 describes.
+  // ---------------------------------------------------------------------------
+  template <typename Fill>
+  bool TryPushWith(Fill&& fill) {
+    const std::size_t tail = tail_.load(std::memory_order_relaxed);
+    const std::size_t next_tail = (tail + 1) & kMask;
+    const std::size_t head = head_.load(std::memory_order_acquire);
+    if (next_tail == head) {
+      return false;  // Full.
+    }
+    if (!fill(slots_[tail])) {
+      return false;  // Producer declined to publish; slot stays unpublished.
+    }
+    tail_.store(next_tail, std::memory_order_release);
+    return true;
+  }
+
+  template <typename Consume>
+  bool TryPopWith(Consume&& consume) {
+    const std::size_t head = head_.load(std::memory_order_relaxed);
+    const std::size_t tail = tail_.load(std::memory_order_acquire);
+    if (head == tail) {
+      return false;  // Empty.
+    }
+    consume(slots_[head]);
+    head_.store((head + 1) & kMask, std::memory_order_release);
+    return true;
+  }
+
   // Snapshot only — by the time the caller reads the result, the real value
   // may have already changed, since the other thread runs concurrently.
   // Useful for metrics/logging (e.g. heartbeat queue depth), not for control

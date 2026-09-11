@@ -34,32 +34,40 @@ struct ConfirmedEvent {
 }  // namespace
 
 TEST(Pipeline, CaptureRingBufferDetectorConfirmerEndToEnd) {
-  constexpr std::size_t kRingCapacity = 64;
+  // Small capacity on purpose (ADR-0003): Frames are ~2.6MB each, and a
+  // real pipeline should buffer a handful of frames, not thousands.
+  constexpr std::size_t kRingCapacity = 8;
   constexpr std::uint64_t kTotalFrames = 5000;
   constexpr std::uint64_t kBurstLength = 8;   // 8 consecutive positive frames per event...
   constexpr std::uint64_t kPeriod = 50;       // ...once every 50 frames.
   constexpr std::uint32_t kK = 3, kN = 5;     // Needs 3 of the last 5 frames positive to confirm.
 
-  // See ring_buffer.h: heap-allocate, never a stack local, even though
-  // Frame at 64x64 is small here — the habit is what matters, since a
-  // resolution bump later would silently reintroduce the stack-overflow
-  // risk if this were ever copy-pasted with a stack declaration.
   auto rb = std::make_unique<ridgeline::SpscRingBuffer<ridgeline::Frame, kRingCapacity>>();
 
   std::atomic<bool> capture_done{false};
   std::atomic<std::uint64_t> frames_captured{0};
-  std::atomic<std::uint64_t> frames_dropped{0};  // Ring buffer was full when capture tried to push.
+  std::atomic<std::uint64_t> full_retries{0};
 
+  // This test checks LOGIC (ordering, exact confirmation count), so the
+  // producer RETRIES when the buffer is full instead of dropping. A dropped
+  // frame would shift FakeDetector's burst pattern and make the expected
+  // episode count unpredictable. Real capture (tools/ridgeline_edge.cc)
+  // drops instead, because a live camera can't wait -- that behavior is
+  // measured there, not asserted here.
   std::thread capture([&] {
     ridgeline::SyntheticFrameSource source(/*width=*/64, /*height=*/64);
-    ridgeline::Frame f;
     for (std::uint64_t i = 0; i < kTotalFrames; ++i) {
-      ASSERT_TRUE(source.Next(f)) << "synthetic frame " << i << " unexpectedly exceeded Frame capacity";
-      if (rb->TryPush(f)) {
-        frames_captured.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        frames_dropped.fetch_add(1, std::memory_order_relaxed);
+      bool source_ok = true;
+      // Frames are written straight into the ring slot: no Frame local, no copy.
+      while (!rb->TryPushWith([&](ridgeline::Frame& slot) {
+        source_ok = source.Next(slot);
+        return source_ok;
+      })) {
+        ASSERT_TRUE(source_ok) << "synthetic frame " << i << " unexpectedly exceeded Frame capacity";
+        full_retries.fetch_add(1, std::memory_order_relaxed);
+        std::this_thread::yield();
       }
+      frames_captured.fetch_add(1, std::memory_order_relaxed);
     }
     capture_done.store(true, std::memory_order_release);
   });
@@ -69,14 +77,9 @@ TEST(Pipeline, CaptureRingBufferDetectorConfirmerEndToEnd) {
   std::thread consume([&] {
     ridgeline::FakeDetector detector(kBurstLength, kPeriod);
     ridgeline::KOfNConfirmer confirmer(kK, kN);
-    ridgeline::Frame f;
     bool was_confirmed = false;  // Track the false->true edge; see kofn_confirmer.h's note on level vs edge.
 
-    while (!capture_done.load(std::memory_order_acquire) || rb->SizeApprox() > 0) {
-      if (!rb->TryPop(f)) {
-        std::this_thread::yield();
-        continue;
-      }
+    auto process = [&](ridgeline::Frame& f) {
       frame_indices_seen.push_back(f.frame_index);
       const auto result = detector.Detect(f);
       const bool now_confirmed = confirmer.Update(result.positive);
@@ -84,6 +87,12 @@ TEST(Pipeline, CaptureRingBufferDetectorConfirmerEndToEnd) {
         confirmed.push_back({f.frame_index, ridgeline::NowUnixNs() - f.capture_time_unix_ns});
       }
       was_confirmed = now_confirmed;
+    };
+
+    while (!capture_done.load(std::memory_order_acquire) || rb->SizeApprox() > 0) {
+      if (!rb->TryPopWith(process)) {
+        std::this_thread::yield();
+      }
     }
   });
 
@@ -142,7 +151,7 @@ TEST(Pipeline, CaptureRingBufferDetectorConfirmerEndToEnd) {
   }
 
   std::fprintf(stderr,
-               "[pipeline] captured=%llu dropped=%llu confirmed_episodes=%zu (K=%u,N=%u,burst_length=%llu,period=%llu)\n",
-               static_cast<unsigned long long>(frames_captured.load()), static_cast<unsigned long long>(frames_dropped.load()),
+               "[pipeline] captured=%llu full_retries=%llu confirmed_episodes=%zu (K=%u,N=%u,burst_length=%llu,period=%llu)\n",
+               static_cast<unsigned long long>(frames_captured.load()), static_cast<unsigned long long>(full_retries.load()),
                confirmed.size(), kK, kN, static_cast<unsigned long long>(kBurstLength), static_cast<unsigned long long>(kPeriod));
 }

@@ -2,44 +2,41 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
+#include <cstring>
 
 #include "ridgeline/frame.h"
 #include "ridgeline/time.h"
 
 namespace ridgeline {
 
-// STUDY NOTE: this stands in for real camera/video-file capture (OpenCV
-// VideoCapture reading an .mp4, in Phase 1b-ii) so the rest of the pipeline
-// — ring buffer, detector interface, K-of-N confirmation, gRPC emission —
-// can be built and TESTED right now, without a video file, without OpenCV,
-// and without the tests depending on real decoded pixel data none of them
-// actually look at. Swapping this for real capture later changes exactly
-// one component; nothing downstream needs to know the difference, which is
-// the same "code against an interface" idea as detector.h.
+// Stands in for real capture (VideoFileFrameSource, which needs OpenCV) so the
+// pipeline wiring can be tested with no video file and no OpenCV dependency.
 //
-// Generates a tiny valid Frame (a small solid-color block, not a real
-// image — nothing downstream currently inspects pixel content) at a fixed
-// resolution, tagged with a monotonic frame_index and a real capture
-// timestamp so downstream latency measurements are meaningful even though
-// the pixels themselves are synthetic.
+// Next() fills a Frame IN PLACE — designed to be called from inside
+// SpscRingBuffer::TryPushWith, so the synthetic pixels are written straight
+// into the ring slot with no intermediate copy. (An earlier version filled a
+// thread_local scratch vector and then copied it in; unnecessary once the
+// ring buffer grew a zero-copy API.)
+//
+// Pixels are a solid gray level that changes with frame_index. Nothing
+// downstream of this source inspects pixel content (FakeDetector keys off
+// frame_index), but the bytes are valid BGR24 so a real detector could run on
+// them without crashing.
 class SyntheticFrameSource {
  public:
   explicit SyntheticFrameSource(std::uint32_t width = 64, std::uint32_t height = 64) : width_(width), height_(height) {}
 
-  // Fills `out` with the next synthetic frame. Returns false only if the
-  // frame is somehow too large for Frame's fixed storage (see frame.h) —
-  // at 64x64 NV12 (~6KB) this will never happen in practice, but the
-  // return value is checked rather than ignored so a future resolution
-  // change that DOES exceed capacity fails loudly here instead of
-  // silently corrupting whatever frame was already in the slot.
   bool Next(Frame& out) {
-    const std::size_t bytes = static_cast<std::size_t>(width_) * height_ * 3 / 2;  // NV12
-    thread_local std::vector<std::byte> scratch;
-    scratch.assign(bytes, std::byte{static_cast<unsigned char>(next_index_ % 256)});
-    const bool ok = out.CopyFrom(scratch.data(), scratch.size(), width_, height_, NowUnixNs(), next_index_);
-    ++next_index_;
-    return ok;
+    const std::size_t bytes = static_cast<std::size_t>(width_) * height_ * Frame::kBytesPerPixel;
+    if (bytes > Frame::kMaxBytes) return false;
+    std::memset(out.MutablePixels(), static_cast<int>(next_index_ % 256), bytes);
+    out.used_bytes = bytes;
+    out.width = width_;
+    out.height = height_;
+    out.format = PixelFormat::kBgr24;
+    out.capture_time_unix_ns = NowUnixNs();
+    out.frame_index = next_index_++;
+    return true;
   }
 
  private:

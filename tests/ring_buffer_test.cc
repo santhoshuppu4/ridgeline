@@ -192,37 +192,117 @@ TEST(RingBufferStress, ConcurrentProducerConsumerPreservesOrderAndCount) {
 #include "ridgeline/frame.h"
 
 TEST(RingBufferWithFrame, PushAndPopRealFrame) {
-  // Frame is ~1.3MB (see frame.h). A ring buffer of 4 Frame slots embeds
-  // ~5.3MB of storage directly in the SpscRingBuffer object. Declaring THAT
-  // as a plain stack local blows the default ~8MB thread stack once you add
-  // a Frame-sized local on top of it and ASan's redzone overhead — this test
-  // originally crashed with AddressSanitizer: stack-overflow for exactly
-  // that reason. The fix, and the real-world lesson: "arena, allocated
-  // once" still means one heap allocation for the whole arena, made once at
-  // startup — not zero allocations ever. Only the per-push/per-pop path is
-  // allocation-free. The agent will construct its ring buffer the same way:
-  // heap-allocated once in main(), never as a stack local.
-  auto rb_ptr = std::make_unique<ridgeline::SpscRingBuffer<ridgeline::Frame, 4>>();
-  auto& rb = *rb_ptr;
+  // Frame is ~2.6MB (1280x720 BGR, see frame.h). A ring buffer of 4 Frame
+  // slots embeds ~10.6MB directly in the SpscRingBuffer object, so it MUST be
+  // heap-allocated. Phase 1a's version of this test crashed with an ASan
+  // stack-overflow when the ring buffer was a stack local. The Frames used
+  // here are heap-allocated too, for the same reason: two 2.6MB Frame locals
+  // plus sanitizer redzones is too close to the default thread stack.
+  auto rb = std::make_unique<ridgeline::SpscRingBuffer<ridgeline::Frame, 4>>();
 
-  ridgeline::Frame f;
-  std::vector<std::byte> fake_pixels(64, std::byte{0xAB});
-  ASSERT_TRUE(f.CopyFrom(fake_pixels.data(), fake_pixels.size(), /*w=*/8, /*h=*/8,
-                         /*capture_ns=*/123456789, /*index=*/1));
-  ASSERT_TRUE(rb.TryPush(std::move(f)));
+  auto f = std::make_unique<ridgeline::Frame>();
+  std::vector<std::byte> fake_pixels(8 * 8 * 3, std::byte{0xAB});
+  ASSERT_TRUE(f->CopyFrom(fake_pixels.data(), fake_pixels.size(), /*w=*/8, /*h=*/8,
+                          /*capture_ns=*/123456789, /*index=*/1));
+  ASSERT_TRUE(rb->TryPush(*f));
 
-  ridgeline::Frame out;
-  ASSERT_TRUE(rb.TryPop(out));
-  EXPECT_EQ(out.width, 8u);
-  EXPECT_EQ(out.height, 8u);
-  EXPECT_EQ(out.used_bytes, 64u);
-  EXPECT_EQ(out.frame_index, 1u);
-  EXPECT_EQ(static_cast<unsigned char>(out.data[0]), 0xAB);
+  auto out = std::make_unique<ridgeline::Frame>();
+  ASSERT_TRUE(rb->TryPop(*out));
+  EXPECT_EQ(out->width, 8u);
+  EXPECT_EQ(out->height, 8u);
+  EXPECT_EQ(out->used_bytes, 8u * 8u * 3u);
+  EXPECT_EQ(out->format, ridgeline::PixelFormat::kBgr24);
+  EXPECT_EQ(out->frame_index, 1u);
+  EXPECT_EQ(out->Pixels()[0], 0xAB);
 }
 
 TEST(RingBufferWithFrame, CopyFromRejectsOversizedInputInsteadOfTruncating) {
-  ridgeline::Frame f;
+  auto f = std::make_unique<ridgeline::Frame>();
   std::vector<std::byte> too_big(ridgeline::Frame::kMaxBytes + 1);
-  EXPECT_FALSE(f.CopyFrom(too_big.data(), too_big.size(), 9999, 9999, 0, 0));
-  EXPECT_EQ(f.used_bytes, 0u) << "a rejected copy must not partially mutate the frame";
+  EXPECT_FALSE(f->CopyFrom(too_big.data(), too_big.size(), 9999, 9999, 0, 0));
+  EXPECT_EQ(f->used_bytes, 0u) << "a rejected copy must not partially mutate the frame";
+}
+
+// ---------------------------------------------------------------------------
+// Zero-copy API: TryPushWith / TryPopWith (see ring_buffer.h).
+// ---------------------------------------------------------------------------
+
+TEST(RingBufferZeroCopy, FillAndConsumeInPlace) {
+  auto rb = std::make_unique<ridgeline::SpscRingBuffer<ridgeline::Frame, 4>>();
+
+  ASSERT_TRUE(rb->TryPushWith([](ridgeline::Frame& slot) {
+    slot.width = 2;
+    slot.height = 1;
+    slot.used_bytes = 6;
+    slot.format = ridgeline::PixelFormat::kBgr24;
+    slot.frame_index = 42;
+    slot.MutablePixels()[0] = 7;
+    return true;
+  }));
+
+  bool consumed = false;
+  ASSERT_TRUE(rb->TryPopWith([&](ridgeline::Frame& slot) {
+    consumed = true;
+    EXPECT_EQ(slot.frame_index, 42u);
+    EXPECT_EQ(slot.width, 2u);
+    EXPECT_EQ(slot.Pixels()[0], 7);
+  }));
+  EXPECT_TRUE(consumed);
+  EXPECT_FALSE(rb->TryPopWith([](ridgeline::Frame&) { ADD_FAILURE() << "consume must not run on an empty buffer"; }));
+}
+
+TEST(RingBufferZeroCopy, DeclinedFillPublishesNothing) {
+  ridgeline::SpscRingBuffer<int, 4> rb;
+  EXPECT_FALSE(rb.TryPushWith([](int& slot) {
+    slot = 99;
+    return false;  // e.g. decoder hit end-of-file
+  }));
+  EXPECT_EQ(rb.SizeApprox(), 0u);
+  int out = 0;
+  EXPECT_FALSE(rb.TryPop(out)) << "a declined fill must not make the slot visible to the consumer";
+}
+
+TEST(RingBufferZeroCopy, FillNotCalledWhenFull) {
+  ridgeline::SpscRingBuffer<int, 4> rb;  // capacity() == 3
+  for (int i = 0; i < 3; ++i) ASSERT_TRUE(rb.TryPush(i));
+  bool called = false;
+  EXPECT_FALSE(rb.TryPushWith([&](int&) {
+    called = true;
+    return true;
+  }));
+  EXPECT_FALSE(called) << "fill must not touch a slot the consumer still owns";
+}
+
+// Same ordering stress test as RingBufferStress, but through the zero-copy
+// API. Under TSan this verifies the in-place write/read ownership handoff.
+TEST(RingBufferZeroCopy, ConcurrentStressPreservesOrder) {
+  constexpr std::uint64_t kTotal = 1'000'000;
+  auto rb = std::make_unique<ridgeline::SpscRingBuffer<std::uint64_t, 1024>>();
+
+  std::thread producer([&] {
+    for (std::uint64_t i = 0; i < kTotal; ++i) {
+      while (!rb->TryPushWith([i](std::uint64_t& slot) {
+        slot = i;
+        return true;
+      })) {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  std::uint64_t expected = 0;
+  std::thread consumer([&] {
+    while (expected < kTotal) {
+      if (!rb->TryPopWith([&](std::uint64_t& slot) {
+            ASSERT_EQ(slot, expected);
+            ++expected;
+          })) {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  producer.join();
+  consumer.join();
+  EXPECT_EQ(expected, kTotal);
 }

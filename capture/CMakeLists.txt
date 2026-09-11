@@ -1,0 +1,3 @@
+add_library(ridgeline_capture STATIC src/video_file_frame_source.cc)
+target_include_directories(ridgeline_capture PUBLIC include)
+target_link_libraries(ridgeline_capture PUBLIC ridgeline_core PRIVATE ridgeline_ext_opencv ridgeline_warnings)

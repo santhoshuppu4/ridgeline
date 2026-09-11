@@ -55,11 +55,30 @@ questions to be able to answer from memory before calling this "known."
 
 - [x] **Phase 0** — contracts, agent/gateway streaming, backoff, sanitizer CI, smoke test
 - [x] **Phase 1a** — lock-free SPSC ring buffer + arena-backed Frame, tested under ASan/UBSan/TSan
-- [ ] **Phase 1b** — wire the ring buffer into the agent: real capture thread, ONNX Runtime CPU inference, K-of-N confirmation, WAL + replay
-- [ ] **Phase 1c** — Kafka, DynamoDB shadow, Redis
+- [x] **Phase 1b-i** — K-of-N confirmation, detector interface, synthetic capture pipeline
+- [x] **Phase 1b-ii** — OpenCV video capture, ONNX Runtime CPU inference (YOLOX-nano, COCO classes), zero-copy frame ring, `ridgeline_edge` tool
+- [ ] **Phase 1b-iii** — feed confirmed events from the edge pipeline into the agent's gRPC stream
+- [ ] **Phase 1c** — write-ahead log + replay across agent restarts
+- [ ] **Phase 1d** — Kafka, DynamoDB shadow, Redis
 - [ ] **Phase 2** — device simulator, config reconciliation, benchmarks
 - [ ] **Phase 3** — mTLS device identity, multi-tenancy, rate limiting, signed OTA
 - [ ] **Phase 4** — weather fusion, alert engine, Terraform
+
+## Phase 1b-ii: real inference (optional build)
+
+```bash
+sudo apt-get install -y libopencv-dev
+./scripts/fetch-phase1b-assets.sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_WITH_ONNX=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/tools/ridgeline_infer_bench --threads=1
+./build/tools/ridgeline_make_sample_video
+./build/tools/ridgeline_edge --video=third_party/testdata/sample.avi --classes=16
+```
+
+The stock model detects COCO classes (person, car, dog, ...), **not smoke**.
+See `context/adr/0005-onnx-runtime-cpu-inference.md`.
 
 ## Honesty notes
 
