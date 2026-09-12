@@ -47,8 +47,10 @@ endif()
 if(RIDGELINE_WITH_ONNX OR RIDGELINE_WITH_KAFKA OR RIDGELINE_WITH_REDIS OR RIDGELINE_WITH_DYNAMODB)
   include(cmake/Dependencies.cmake)
 endif()
+find_package(OpenSSL REQUIRED)  # ridgeline_ota always needs this; unconditional, not gated by any RIDGELINE_WITH_* flag.
 
 add_subdirectory(core)
+add_subdirectory(ota)
 if(RIDGELINE_WITH_KAFKA)
   add_subdirectory(kafka)
 endif()

@@ -30,3 +30,6 @@ if(RIDGELINE_BUILD_NET)
   target_include_directories(ridgeline_gap_protocol_test PRIVATE .)
   target_link_libraries(ridgeline_gap_protocol_test PRIVATE ridgeline_core ridgeline_proto ridgeline_warnings Threads::Threads)
 endif()
+
+add_executable(ridgeline_ota_tool ota_tool.cc)
+target_link_libraries(ridgeline_ota_tool PRIVATE ridgeline_ota ridgeline_core ridgeline_warnings)

@@ -39,6 +39,11 @@ jobs:
       - name: mTLS device identity test (ADR-0011)
         if: matrix.net == 'ON'
         run: ./scripts/mtls_test.sh build
+      - name: Config reconciliation test (ADR-0012)
+        if: matrix.net == 'ON'
+        run: ./scripts/config_reconciliation_test.sh build
+      - name: OTA manifest signing test (ADR-0012)
+        run: ./scripts/ota_test.sh build
 
   # Phase 1b-ii: real ONNX Runtime inference + OpenCV video decode.
   # Separate job because it downloads ~12MB of pinned, checksum-verified

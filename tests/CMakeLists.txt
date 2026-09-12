@@ -37,3 +37,7 @@ if(RIDGELINE_WITH_DYNAMODB)
                                                Threads::Threads GTest::gtest_main)
   gtest_discover_tests(dynamodb_tests DISCOVERY_TIMEOUT 30)
 endif()
+
+add_executable(ota_tests ota/ota_manifest_test.cc)
+target_link_libraries(ota_tests PRIVATE ridgeline_ota ridgeline_warnings Threads::Threads GTest::gtest_main)
+gtest_discover_tests(ota_tests)

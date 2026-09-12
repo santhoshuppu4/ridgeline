@@ -63,8 +63,9 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 1d-ii** — Redis hot state (real redis-server tested), DynamoDB device shadow (hand-rolled SigV4, optimistic concurrency, fake-transport tested)
 - [x] **Phase 2** — fleet device simulator (thread-per-connection measured: 161 threads/150 devices; a real reconnect-vs-gap-tracking bug found and documented)
 - [x] **Phase 3-i** — mTLS device identity: cert CN cross-checked against claimed device_id, verified against real impersonation attempts; found and fixed an unrelated fake-detection rate-loop bug along the way
-- [ ] **Phase 3-ii** — multi-tenancy, rate limiting, signed OTA
-- [ ] **Phase 4** — weather fusion, alert engine, Terraform
+- [x] **Phase 4** — config reconciliation (real live rate/K-of-N changes, both agent modes) and signed OTA manifest trust (Ed25519, hand-rolled, 4 mutation tests); full binary distribution/A-B-swap/watchdog rollback scoped out explicitly
+- [ ] **Phase 3-ii** — multi-tenancy, rate limiting
+- [ ] **Phase 5** — weather fusion, alert engine, Terraform
 
 ## Phase 1b-ii: real inference (optional build)
 
@@ -176,6 +177,27 @@ Without any `--tls-*` flags, both sides behave exactly as before (plaintext).
 including an unrelated rate-loop bug found and fixed along the way, and a
 known (documented, not yet fixed) issue with `--duration-s` being a soft
 limit when a gateway is unreachable.
+
+## Phase 4: config reconciliation + signed OTA manifest
+
+```bash
+cat > /tmp/device-configs.txt <<'EOC'
+cam-0001,7,3,5,0.35,15
+EOC
+./build/gateway/ridgeline_gateway --listen=0.0.0.0:50051 --device-configs=/tmp/device-configs.txt
+./build/agent/ridgeline_agent --gateway=127.0.0.1:50051 --device-id=cam-0001 --state-dir=/tmp/cam1 --rate-hz=5
+
+./build/tools/ridgeline_ota_tool genkey --out-prefix=/tmp/ota-keys
+./build/tools/ridgeline_ota_tool sign --private-key=/tmp/ota-keys.private.pem --version=42 \
+  --binary-sha256=$(sha256sum some-binary | cut -d' ' -f1) --url=https://example.com/agent-v42.bin --out=/tmp/manifest.signed
+./build/tools/ridgeline_ota_tool verify --public-key=/tmp/ota-keys.public.pem --manifest=/tmp/manifest.signed
+```
+
+`scripts/config_reconciliation_test.sh` and `scripts/ota_test.sh` run the
+real end-to-end checks. See `context/adr/0012-config-reconciliation-and-ota-manifest.md`
+for exactly what signed OTA does and does not cover here -- binary
+download, A/B partition swap, and watchdog rollback are explicitly
+out of scope for this phase.
 
 ## Honesty notes
 

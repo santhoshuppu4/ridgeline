@@ -31,6 +31,11 @@ message Heartbeat {
   int64 sent_time_unix_ns = 1;
   uint32 queue_depth = 2;
   uint64 frames_dropped = 3;
+  // Which ConfigUpdate.version this agent currently has applied (0 =
+  // running its startup defaults, no update ever applied). Lets the
+  // gateway compare against desired config and only push an update when
+  // there's actually a difference -- see ADR-0012.
+  uint64 applied_config_version = 4;
 }
 
 message AgentMessage {

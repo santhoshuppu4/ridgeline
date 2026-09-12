@@ -208,6 +208,22 @@ int main(int argc, char** argv) {
   std::atomic<std::uint64_t> queue_depth{0};
   std::atomic<std::uint64_t> frames_dropped{0};
 
+  // Config reconciliation (ADR-0012): the reader thread (below) writes a
+  // newly-received ConfigUpdate here whenever the gateway pushes one; the
+  // producer thread (fake-detection or --video) polls it and applies
+  // changes, then advances applied_config_version, which the heartbeat
+  // block reports back to the gateway -- closing the desired/reported loop.
+  std::mutex config_mu;
+  ridgeline::v1::ConfigUpdate pending_config;
+  bool pending_config_set = false;
+  std::atomic<std::uint64_t> applied_config_version{0};
+  std::atomic<double> current_rate_hz{opt.rate_hz};       // Fake-detection mode reads this each cycle.
+#ifdef RIDGELINE_HAVE_ONNX
+  std::atomic<std::uint32_t> current_confirm_k{opt.k};    // --video mode reads these when (re)building EdgePipeline.
+  std::atomic<std::uint32_t> current_confirm_n{opt.n};
+  std::atomic<float> current_score_threshold{opt.score};
+#endif
+
   std::thread producer;
   std::atomic<bool> producer_done{false};
 
@@ -230,37 +246,66 @@ int main(int argc, char** argv) {
 #ifdef RIDGELINE_HAVE_ONNX
   if (!opt.video.empty()) {
     producer = std::thread([&] {
-      ridgeline::EdgePipelineConfig config;
-      config.video_path = opt.video;
-      config.model_path = opt.model;
-      config.target_class_ids = opt.classes;
-      config.k = opt.k;
-      config.n = opt.n;
-      config.intra_op_threads = opt.threads;
-      config.score_threshold = opt.score;
-      config.realtime = true;
-      config.loop = opt.loop;
+      bool config_changed = false;
+      while (!g_stop.load() && !time_up()) {
+        ridgeline::EdgePipelineConfig config;
+        config.video_path = opt.video;
+        config.model_path = opt.model;
+        config.target_class_ids = opt.classes;
+        config.k = current_confirm_k.load();
+        config.n = current_confirm_n.load();
+        config.intra_op_threads = opt.threads;
+        config.score_threshold = current_score_threshold.load();
+        config.realtime = true;
+        config.loop = opt.loop;
 
-      ridgeline::SpscRingBuffer<ridgeline::ConfirmedEvent, 256> events;
-      ridgeline::EdgePipeline pipeline(config, events);
-      ridgeline::ConfirmedEvent ev;
-      while (!g_stop.load() && !time_up() && (!pipeline.Finished() || events.SizeApprox() > 0)) {
-        queue_depth.store(pipeline.FrameQueueDepth(), std::memory_order_relaxed);
-        frames_dropped.store(pipeline.FramesDropped(), std::memory_order_relaxed);
-        if (events.TryPop(ev)) {
-          ridgeline::v1::DetectionEvent d;
-          d.set_label("smoke");
-          d.set_confidence(ev.confidence);
-          auto* box = d.mutable_bbox();
-          box->set_x_min(ev.x_min); box->set_y_min(ev.y_min); box->set_x_max(ev.x_max); box->set_y_max(ev.y_max);
-          d.set_capture_time_unix_ns(ev.capture_time_unix_ns);
-          d.set_emit_time_unix_ns(ridgeline::NowUnixNs());
-          d.set_frames_confirmed(ev.frames_confirmed);
-          d.set_window_size(ev.window_size);
-          emit(std::move(d));
-        } else {
-          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        ridgeline::SpscRingBuffer<ridgeline::ConfirmedEvent, 256> events;
+        ridgeline::EdgePipeline pipeline(config, events);
+        ridgeline::ConfirmedEvent ev;
+        config_changed = false;
+        while (!g_stop.load() && !time_up() && (!pipeline.Finished() || events.SizeApprox() > 0)) {
+          queue_depth.store(pipeline.FrameQueueDepth(), std::memory_order_relaxed);
+          frames_dropped.store(pipeline.FramesDropped(), std::memory_order_relaxed);
+          if (events.TryPop(ev)) {
+            ridgeline::v1::DetectionEvent d;
+            d.set_label("smoke");
+            d.set_confidence(ev.confidence);
+            auto* box = d.mutable_bbox();
+            box->set_x_min(ev.x_min); box->set_y_min(ev.y_min); box->set_x_max(ev.x_max); box->set_y_max(ev.y_max);
+            d.set_capture_time_unix_ns(ev.capture_time_unix_ns);
+            d.set_emit_time_unix_ns(ridgeline::NowUnixNs());
+            d.set_frames_confirmed(ev.frames_confirmed);
+            d.set_window_size(ev.window_size);
+            emit(std::move(d));
+          } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          }
+
+          // Config reconciliation (ADR-0012): EdgePipeline's K-of-N and
+          // score threshold are fixed at construction (see edge_pipeline.h),
+          // so applying a new value means rebuilding the pipeline, not
+          // mutating it in place. Breaking this inner loop lets `pipeline`
+          // go out of scope (its destructor stops both internal threads
+          // cleanly), and the outer loop reconstructs it with the new
+          // atomics -- a real config-driven restart, not a no-op.
+          std::lock_guard<std::mutex> lock(config_mu);
+          if (pending_config_set) {
+            const auto& cfg = pending_config;
+            if (cfg.confirm_k() > 0) current_confirm_k.store(cfg.confirm_k());
+            if (cfg.confirm_n() > 0) current_confirm_n.store(cfg.confirm_n());
+            if (cfg.confidence_threshold() > 0) current_score_threshold.store(cfg.confidence_threshold());
+            applied_config_version.store(cfg.version());
+            std::fprintf(stderr,
+                         "[agent] applied config version=%llu: confirm_k=%u confirm_n=%u score_threshold=%.2f "
+                         "(rebuilding pipeline)\n",
+                         static_cast<unsigned long long>(cfg.version()), current_confirm_k.load(),
+                         current_confirm_n.load(), static_cast<double>(current_score_threshold.load()));
+            pending_config_set = false;
+            config_changed = true;
+          }
+          if (config_changed) break;
         }
+        if (!config_changed) break;  // Pipeline genuinely finished (or g_stop/time_up fired), not a config-driven restart.
       }
       producer_done.store(true, std::memory_order_release);
     });
@@ -276,7 +321,7 @@ int main(int argc, char** argv) {
     producer = std::thread([&] {
       std::mt19937_64 rng{std::random_device{}()};
       std::uniform_real_distribution<float> conf{0.40f, 0.95f};
-      const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>{1.0 / opt.rate_hz});
+      auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>{1.0 / current_rate_hz.load()});
       auto next_due = Clock::now();
       while (!g_stop.load() && !time_up()) {
         // Wait for the full period in short slices (so SIGINT/g_stop is
@@ -296,6 +341,24 @@ int main(int argc, char** argv) {
         // 2s * 5Hz. Confirmed by reproducing with zero TLS involved.
         while (!g_stop.load() && !time_up() && Clock::now() < next_due) {
           std::this_thread::sleep_for(std::min<Clock::duration>(next_due - Clock::now(), 50ms));
+
+          // Config reconciliation (ADR-0012): checked in this short-sleep
+          // slice so a new target_fps takes effect within ~50ms of arriving,
+          // not just at the top of the outer loop. Applying it here means
+          // "adjust rate_hz" is a live parameter change, not a restart.
+          std::lock_guard<std::mutex> lock(config_mu);
+          if (pending_config_set) {
+            const auto& cfg = pending_config;
+            if (cfg.target_fps() > 0) {
+              current_rate_hz.store(cfg.target_fps());
+              period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>{1.0 / cfg.target_fps()});
+              next_due = Clock::now();  // Re-baseline: don't apply a stale next_due computed under the old rate.
+            }
+            applied_config_version.store(cfg.version());
+            std::fprintf(stderr, "[agent] applied config version=%llu: rate_hz=%.1f\n",
+                         static_cast<unsigned long long>(cfg.version()), current_rate_hz.load());
+            pending_config_set = false;
+          }
         }
         if (g_stop.load() || time_up()) break;
 
@@ -378,6 +441,17 @@ int main(int argc, char** argv) {
           outbox.AckUpTo(msg.ack().up_to_seq());
           wal.Acknowledge(msg.ack().up_to_seq());
           got_ack.store(true);
+        } else if (msg.has_config()) {
+          std::lock_guard<std::mutex> lock(config_mu);
+          if (msg.config().version() > pending_config.version() ||
+              (!pending_config_set && applied_config_version.load() < msg.config().version())) {
+            pending_config = msg.config();
+            pending_config_set = true;
+            std::fprintf(stderr, "[agent] received config update version=%llu (confirm_k=%u confirm_n=%u "
+                                 "confidence_threshold=%.2f target_fps=%u)\n",
+                         static_cast<unsigned long long>(msg.config().version()), msg.config().confirm_k(),
+                         msg.config().confirm_n(), msg.config().confidence_threshold(), msg.config().target_fps());
+          }
         }
       }
     });
@@ -431,6 +505,7 @@ int main(int argc, char** argv) {
         hb->set_sent_time_unix_ns(ridgeline::NowUnixNs());
         hb->set_queue_depth(static_cast<std::uint32_t>(queue_depth.load(std::memory_order_relaxed)));
         hb->set_frames_dropped(frames_dropped.load(std::memory_order_relaxed));
+        hb->set_applied_config_version(applied_config_version.load(std::memory_order_relaxed));
         ok = stream->Write(m);
         next_heartbeat += 1s;
       }

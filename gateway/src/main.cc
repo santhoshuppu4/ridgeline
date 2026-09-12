@@ -26,7 +26,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -75,7 +77,44 @@ struct GatewayIntegrations {
 #ifdef RIDGELINE_HAVE_DYNAMODB
   ridgeline::DeviceShadowStore* shadow_store = nullptr;
 #endif
+  std::string desired_configs_path;  // Empty = config reconciliation disabled. See ADR-0012.
 };
+
+// Parses the simple desired-config file format:
+//   device_id,version,confirm_k,confirm_n,confidence_threshold,target_fps
+// One device per line; blank lines and lines starting with '#' are
+// skipped. Deliberately not JSON/YAML: this avoids pulling in a parsing
+// dependency for a feature that has nothing to do with Kafka/Redis/
+// DynamoDB and should work in every build configuration. Reloaded fresh on
+// every call rather than cached -- correctness over micro-optimization at
+// this scale; a real fleet-scale version would cache with an mtime check.
+std::map<std::string, ridgeline::v1::ConfigUpdate> LoadDesiredConfigs(const std::string& path) {
+  std::map<std::string, ridgeline::v1::ConfigUpdate> out;
+  std::ifstream in(path);
+  if (!in) {
+    std::fprintf(stderr, "[gateway] WARNING: could not read --device-configs=%s\n", path.c_str());
+    return out;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream ss(line);
+    std::string device_id, version_s, k_s, n_s, conf_s, fps_s;
+    if (!std::getline(ss, device_id, ',') || !std::getline(ss, version_s, ',') || !std::getline(ss, k_s, ',') ||
+        !std::getline(ss, n_s, ',') || !std::getline(ss, conf_s, ',') || !std::getline(ss, fps_s, ',')) {
+      std::fprintf(stderr, "[gateway] WARNING: malformed line in %s, skipped: %s\n", path.c_str(), line.c_str());
+      continue;
+    }
+    ridgeline::v1::ConfigUpdate cfg;
+    cfg.set_version(std::strtoull(version_s.c_str(), nullptr, 10));
+    cfg.set_confirm_k(static_cast<std::uint32_t>(std::strtoul(k_s.c_str(), nullptr, 10)));
+    cfg.set_confirm_n(static_cast<std::uint32_t>(std::strtoul(n_s.c_str(), nullptr, 10)));
+    cfg.set_confidence_threshold(static_cast<float>(std::atof(conf_s.c_str())));
+    cfg.set_target_fps(static_cast<std::uint32_t>(std::strtoul(fps_s.c_str(), nullptr, 10)));
+    out[device_id] = cfg;
+  }
+  return out;
+}
 
 #ifdef RIDGELINE_HAVE_DYNAMODB
 // Read-modify-write with bounded retry on optimistic-concurrency conflict.
@@ -197,8 +236,6 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
         case AgentMessage::kHeartbeat: {
           if (device_id.empty()) return {grpc::StatusCode::FAILED_PRECONDITION, "hello must be first"};
           const auto& hb = msg.heartbeat();
-          (void)hb;  // Only read when Redis and/or DynamoDB integrations are compiled in (below); otherwise heartbeats
-                     // are just validated (hello must precede them) and don't need to hold onto the payload.
 #ifdef RIDGELINE_HAVE_REDIS
           if (integrations_.redis != nullptr) {
             ridgeline::DeviceHotState hot;
@@ -219,6 +256,23 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
             UpsertReportedWithRetry(*integrations_.shadow_store, device_id, reported.dump());
           }
 #endif
+          // Config reconciliation (ADR-0012): compare the agent's reported
+          // applied_config_version against desired state and push an
+          // update if it's behind. Config, unlike Redis/DynamoDB above, has
+          // no independent RIDGELINE_WITH_* flag -- it only needs core/proto
+          // types, so it's always available; --device-configs simply
+          // defaults to empty (disabled).
+          if (!integrations_.desired_configs_path.empty()) {
+            const auto desired = LoadDesiredConfigs(integrations_.desired_configs_path);
+            const auto it = desired.find(device_id);
+            if (it != desired.end() && it->second.version() > hb.applied_config_version()) {
+              GatewayMessage gm;
+              *gm.mutable_config() = it->second;
+              if (!stream->Write(gm)) return {grpc::StatusCode::UNAVAILABLE, "failed to write config update"};
+              std::fprintf(stderr, "[gateway] pushed config version=%llu to %s\n",
+                           static_cast<unsigned long long>(it->second.version()), device_id.c_str());
+            }
+          }
           break;
         }
         case AgentMessage::PAYLOAD_NOT_SET:
@@ -247,6 +301,7 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
 int main(int argc, char** argv) {
   std::string listen = "0.0.0.0:50051";
   std::string tls_ca, tls_cert, tls_key;  // All three required together to enable mTLS; see ADR-0011.
+  std::string device_configs_path;  // See ADR-0012.
 #ifdef RIDGELINE_HAVE_KAFKA
   std::string kafka_brokers;
   std::string kafka_topic = "detections.v1";
@@ -273,6 +328,7 @@ int main(int argc, char** argv) {
     else if (auto vca = value("--tls-ca=")) tls_ca = vca;
     else if (auto vcert = value("--tls-cert=")) tls_cert = vcert;
     else if (auto vkey = value("--tls-key=")) tls_key = vkey;
+    else if (auto vcfg = value("--device-configs=")) device_configs_path = vcfg;
 #ifdef RIDGELINE_HAVE_KAFKA
     else if (auto v = value("--kafka-brokers=")) kafka_brokers = v;
     else if (auto v2 = value("--kafka-topic=")) kafka_topic = v2;
@@ -357,6 +413,7 @@ int main(int argc, char** argv) {
   }
 #endif
 
+  integrations.desired_configs_path = device_configs_path;
   IngestServiceImpl service(integrations);
 
   grpc::ServerBuilder builder;
