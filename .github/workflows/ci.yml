@@ -36,6 +36,9 @@ jobs:
       - name: Gap-detection regression test (ADR-0010)
         if: matrix.net == 'ON'
         run: ./scripts/gap_detection_test.sh build
+      - name: mTLS device identity test (ADR-0011)
+        if: matrix.net == 'ON'
+        run: ./scripts/mtls_test.sh build
 
   # Phase 1b-ii: real ONNX Runtime inference + OpenCV video decode.
   # Separate job because it downloads ~12MB of pinned, checksum-verified

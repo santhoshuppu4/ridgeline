@@ -17,12 +17,15 @@
 // passing with nothing else running at all.
 
 #include <grpcpp/grpcpp.h>
+#include <grpcpp/security/auth_context.h>
+#include <grpc/grpc_security_constants.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -49,6 +52,12 @@ using ridgeline::v1::GatewayMessage;
 std::atomic<bool> g_stop{false};
 void OnSignal(int) { g_stop.store(true); }
 bool g_log_events = false;  // Test oracle output; see scripts/chaos_test.sh.
+
+std::string ReadFileOrDie(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) { std::fprintf(stderr, "[gateway] cannot read %s\n", path.c_str()); std::exit(1); }
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
 
 // Bundles every optional external integration into one struct so
 // IngestServiceImpl's constructor stays a single, ordinary parameter list --
@@ -96,7 +105,7 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
  public:
   explicit IngestServiceImpl(GatewayIntegrations integrations) : integrations_(integrations) {}
 
-  grpc::Status Connect(grpc::ServerContext*, grpc::ServerReaderWriter<GatewayMessage, AgentMessage>* stream) override {
+  grpc::Status Connect(grpc::ServerContext* context, grpc::ServerReaderWriter<GatewayMessage, AgentMessage>* stream) override {
     std::string device_id;
     std::uint64_t last_seq = 0, received = 0, duplicates = 0, gap_events = 0;
     // See ADR-0010 / ingest.proto's Hello.durable_resume: true means
@@ -119,6 +128,28 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
       switch (msg.payload_case()) {
         case AgentMessage::kHello:
           if (msg.hello().device_id().empty()) return {grpc::StatusCode::INVALID_ARGUMENT, "hello.device_id is required"};
+          // mTLS identity cross-check (ADR-0011): if the connection is
+          // authenticated via a client certificate, its Common Name is a
+          // cryptographic fact -- the peer proved it holds that cert's
+          // private key. If Hello claims a different device_id, the agent
+          // is either misconfigured or attempting to impersonate another
+          // device; either way, reject it here rather than trusting a
+          // self-reported string, which is exactly the gap ADR-0010 noted
+          // as needing an explicit decision. On a plaintext (non-mTLS)
+          // connection, FindPropertyValues returns empty and this check is
+          // a no-op -- backward compatible with every non-TLS test/script
+          // already in this project.
+          {
+            const auto cn_values = context->auth_context()->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME);
+            if (!cn_values.empty()) {
+              const std::string cert_cn(cn_values[0].data(), cn_values[0].size());
+              if (cert_cn != msg.hello().device_id()) {
+                std::fprintf(stderr, "[gateway] REJECTED: cert CN='%s' does not match claimed device_id='%s'\n",
+                             cert_cn.c_str(), msg.hello().device_id().c_str());
+                return {grpc::StatusCode::PERMISSION_DENIED, "device_id does not match client certificate identity"};
+              }
+            }
+          }
           device_id = msg.hello().device_id();
           last_seq = msg.hello().last_acked_seq();
           durable_resume = msg.hello().durable_resume();
@@ -215,6 +246,7 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
 
 int main(int argc, char** argv) {
   std::string listen = "0.0.0.0:50051";
+  std::string tls_ca, tls_cert, tls_key;  // All three required together to enable mTLS; see ADR-0011.
 #ifdef RIDGELINE_HAVE_KAFKA
   std::string kafka_brokers;
   std::string kafka_topic = "detections.v1";
@@ -238,6 +270,9 @@ int main(int argc, char** argv) {
     };
     if (arg.rfind("--listen=", 0) == 0) listen = std::string{arg.substr(9)};
     else if (arg == "--log-events") g_log_events = true;
+    else if (auto vca = value("--tls-ca=")) tls_ca = vca;
+    else if (auto vcert = value("--tls-cert=")) tls_cert = vcert;
+    else if (auto vkey = value("--tls-key=")) tls_key = vkey;
 #ifdef RIDGELINE_HAVE_KAFKA
     else if (auto v = value("--kafka-brokers=")) kafka_brokers = v;
     else if (auto v2 = value("--kafka-topic=")) kafka_topic = v2;
@@ -325,7 +360,20 @@ int main(int argc, char** argv) {
   IngestServiceImpl service(integrations);
 
   grpc::ServerBuilder builder;
-  builder.AddListeningPort(listen, grpc::InsecureServerCredentials());
+  if (!tls_ca.empty() || !tls_cert.empty() || !tls_key.empty()) {
+    if (tls_ca.empty() || tls_cert.empty() || tls_key.empty()) {
+      std::fprintf(stderr, "[gateway] --tls-ca, --tls-cert, and --tls-key must all be provided together\n");
+      return 2;
+    }
+    grpc::SslServerCredentialsOptions ssl_opts(GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
+    ssl_opts.pem_root_certs = ReadFileOrDie(tls_ca);
+    ssl_opts.pem_key_cert_pairs.push_back({ReadFileOrDie(tls_key), ReadFileOrDie(tls_cert)});
+    builder.AddListeningPort(listen, grpc::SslServerCredentials(ssl_opts));
+    std::fprintf(stderr, "[gateway] mTLS enabled: ca=%s cert=%s (client certs required and verified)\n", tls_ca.c_str(),
+                 tls_cert.c_str());
+  } else {
+    builder.AddListeningPort(listen, grpc::InsecureServerCredentials());
+  }
   builder.RegisterService(&service);
   std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
   if (!server) { std::fprintf(stderr, "[gateway] failed to listen on %s\n", listen.c_str()); return 1; }

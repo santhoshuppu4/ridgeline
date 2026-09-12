@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -68,6 +69,7 @@ struct Options {
   int duration_s = 0;
   std::string state_dir;         // Default derived from device_id below.
   bool log_commits = false;      // Test oracle: print each event's identity once it is durably in the WAL.
+  std::string tls_ca, tls_cert, tls_key;  // All three required together to enable mTLS; see ADR-0011.
 #ifdef RIDGELINE_HAVE_ONNX
   std::string video;
   std::string model = RIDGELINE_DEFAULT_MODEL;
@@ -98,6 +100,9 @@ Options ParseArgs(int argc, char** argv) {
     };
     if (auto v = value("--gateway=")) opt.gateway = v;
     else if (auto v2 = value("--device-id=")) opt.device_id = v2;
+    else if (auto vca = value("--tls-ca=")) opt.tls_ca = vca;
+    else if (auto vcert = value("--tls-cert=")) opt.tls_cert = vcert;
+    else if (auto vkey = value("--tls-key=")) opt.tls_key = vkey;
     else if (auto v3 = value("--rate-hz=")) opt.rate_hz = std::atof(v3);
     else if (auto v4 = value("--duration-s=")) opt.duration_s = std::atoi(v4);
     else if (auto v5 = value("--state-dir=")) opt.state_dir = v5;
@@ -136,6 +141,12 @@ bool WaitForConnection(grpc::Channel& channel, Clock::duration timeout) {
     if (channel.WaitForConnected(std::chrono::system_clock::now() + 250ms)) return true;
   }
   return false;
+}
+
+std::string ReadFileOrDie(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) { std::fprintf(stderr, "[agent] cannot read %s\n", path.c_str()); std::exit(1); }
+  return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
 // All events not yet acked, in ascending seq order. Protected by a mutex --
@@ -268,6 +279,26 @@ int main(int argc, char** argv) {
       const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>{1.0 / opt.rate_hz});
       auto next_due = Clock::now();
       while (!g_stop.load() && !time_up()) {
+        // Wait for the full period in short slices (so SIGINT/g_stop is
+        // noticed promptly), THEN emit -- not "emit, then sleep up to 50ms
+        // and loop regardless of whether the real period elapsed." The
+        // latter is what this loop originally did, and it's a genuine bug:
+        // capping every sleep at 50ms while incrementing next_due by the
+        // FULL period each iteration means next_due drifts further ahead of
+        // real time every single iteration, so the 50ms cap is what
+        // actually governs the loop forever after the first couple of
+        // iterations -- the configured rate_hz is silently ignored whenever
+        // its period exceeds 50ms (rate_hz < 20). Invisible in this project
+        // until now because every prior test used rate_hz >= 20 (smoke_test.sh,
+        // chaos_test.sh, the fleet simulator's defaults); the mTLS test in
+        // ADR-0011 was the first to use --rate-hz=5 --duration-s=2, and got
+        // 40 events instead of the expected 10 -- exactly 2s / 50ms, not
+        // 2s * 5Hz. Confirmed by reproducing with zero TLS involved.
+        while (!g_stop.load() && !time_up() && Clock::now() < next_due) {
+          std::this_thread::sleep_for(std::min<Clock::duration>(next_due - Clock::now(), 50ms));
+        }
+        if (g_stop.load() || time_up()) break;
+
         ridgeline::v1::DetectionEvent d;
         d.set_label("smoke");
         d.set_confidence(conf(rng));
@@ -278,7 +309,6 @@ int main(int argc, char** argv) {
         d.set_emit_time_unix_ns(ts);
         emit(std::move(d));
         next_due += period;
-        if (next_due > Clock::now()) std::this_thread::sleep_for(std::min<Clock::duration>(next_due - Clock::now(), 50ms));
       }
       producer_done.store(true, std::memory_order_release);
     });
@@ -292,7 +322,21 @@ int main(int argc, char** argv) {
   channel_args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, static_cast<int>(backoff.base.count()));
   channel_args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, static_cast<int>(backoff.base.count()));
   channel_args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, static_cast<int>(backoff.cap.count()));
-  auto channel = grpc::CreateCustomChannel(opt.gateway, grpc::InsecureChannelCredentials(), channel_args);
+  auto channel = grpc::CreateCustomChannel(opt.gateway, [&]() -> std::shared_ptr<grpc::ChannelCredentials> {
+    if (opt.tls_ca.empty() && opt.tls_cert.empty() && opt.tls_key.empty()) {
+      return grpc::InsecureChannelCredentials();
+    }
+    if (opt.tls_ca.empty() || opt.tls_cert.empty() || opt.tls_key.empty()) {
+      std::fprintf(stderr, "[agent] --tls-ca, --tls-cert, and --tls-key must all be provided together\n");
+      std::exit(2);
+    }
+    grpc::SslCredentialsOptions ssl_opts;
+    ssl_opts.pem_root_certs = ReadFileOrDie(opt.tls_ca);
+    ssl_opts.pem_private_key = ReadFileOrDie(opt.tls_key);
+    ssl_opts.pem_cert_chain = ReadFileOrDie(opt.tls_cert);
+    std::fprintf(stderr, "[agent] mTLS enabled: presenting cert %s\n", opt.tls_cert.c_str());
+    return grpc::SslCredentials(ssl_opts);
+  }(), channel_args);
   auto stub = ridgeline::v1::IngestService::NewStub(channel);
 
   std::mt19937_64 jitter_rng{std::random_device{}()};

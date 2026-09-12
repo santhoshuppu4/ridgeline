@@ -62,7 +62,8 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 1d-i** — Kafka event backbone: gateway publishes before ack, tested against librdkafka's real mock protocol, standalone mock-broker tool for Docker-free dev
 - [x] **Phase 1d-ii** — Redis hot state (real redis-server tested), DynamoDB device shadow (hand-rolled SigV4, optimistic concurrency, fake-transport tested)
 - [x] **Phase 2** — fleet device simulator (thread-per-connection measured: 161 threads/150 devices; a real reconnect-vs-gap-tracking bug found and documented)
-- [ ] **Phase 3** — mTLS device identity, multi-tenancy, rate limiting, signed OTA
+- [x] **Phase 3-i** — mTLS device identity: cert CN cross-checked against claimed device_id, verified against real impersonation attempts; found and fixed an unrelated fake-detection rate-loop bug along the way
+- [ ] **Phase 3-ii** — multi-tenancy, rate limiting, signed OTA
 - [ ] **Phase 4** — weather fusion, alert engine, Terraform
 
 ## Phase 1b-ii: real inference (optional build)
@@ -157,6 +158,24 @@ reconnecting without WAL-backed resume state from one that actually lost
 events -- confirmed on real hardware: 500 devices, 100% acked, yet false
 `lost=` on nearly every reconnect) and `context/adr/0010-durable-resume-flag.md`
 for the fix, verified in both directions with a dedicated protocol-level test.
+
+## Phase 3-i: mTLS device identity
+
+```bash
+./scripts/generate_test_certs.sh /tmp/ridgeline-certs cam-0001 cam-0002
+./build/gateway/ridgeline_gateway --listen=0.0.0.0:50051 \
+  --tls-ca=/tmp/ridgeline-certs/ca.crt --tls-cert=/tmp/ridgeline-certs/server.crt --tls-key=/tmp/ridgeline-certs/server.key
+./build/agent/ridgeline_agent --gateway=127.0.0.1:50051 --device-id=cam-0001 --state-dir=/tmp/cam1-state \
+  --tls-ca=/tmp/ridgeline-certs/ca.crt --tls-cert=/tmp/ridgeline-certs/cam-0001.crt --tls-key=/tmp/ridgeline-certs/cam-0001.key
+```
+
+Without any `--tls-*` flags, both sides behave exactly as before (plaintext).
+`scripts/mtls_test.sh` verifies matching identity, an impersonation attempt
+(rejected), and a plaintext connection against an mTLS-required gateway
+(handshake never completes). See `context/adr/0011-mtls-device-identity.md`,
+including an unrelated rate-loop bug found and fixed along the way, and a
+known (documented, not yet fixed) issue with `--duration-s` being a soft
+limit when a gateway is unreachable.
 
 ## Honesty notes
 
