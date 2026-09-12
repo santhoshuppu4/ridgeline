@@ -343,6 +343,7 @@ int main(int argc, char** argv) {
     hello->set_device_id(opt.device_id);
     hello->set_agent_version(RIDGELINE_VERSION);
     hello->set_last_acked_seq(wal.LastAcked());
+    hello->set_durable_resume(true);  // The WAL makes last_acked_seq trustworthy resume state; see ADR-0010.
     bool ok = stream->Write(hello_msg);
 
     if (ok) {

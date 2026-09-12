@@ -151,10 +151,12 @@ cmake --build build --target ridgeline_device_simulator
 in CI (10 devices, no fault injection, every sent event must be acked). Real
 throughput/latency/thread-count numbers need real multi-core hardware --
 this project's own sandbox has one CPU core, which is exactly why those
-numbers aren't reported from CI. See `context/adr/0009-fleet-device-simulator.md`,
-including a real design gap found: the gateway currently can't distinguish
-a device that reconnected without WAL-backed resume state from one that
-actually lost events.
+numbers aren't reported from CI. See `context/adr/0009-fleet-device-simulator.md`
+for a real design gap found (the gateway couldn't distinguish a device
+reconnecting without WAL-backed resume state from one that actually lost
+events -- confirmed on real hardware: 500 devices, 100% acked, yet false
+`lost=` on nearly every reconnect) and `context/adr/0010-durable-resume-flag.md`
+for the fix, verified in both directions with a dedicated protocol-level test.
 
 ## Honesty notes
 

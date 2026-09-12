@@ -7,6 +7,13 @@ message Hello {
   string device_id = 1;
   string agent_version = 2;
   uint64 last_acked_seq = 3;
+  // True if last_acked_seq reflects real, persisted resume state (a WAL or
+  // equivalent) -- the real agent always sets this true. False means the
+  // device has no durable memory of what it's sent before (e.g. this
+  // simulator, or a real device that lost its WAL/was factory-reset): its
+  // last_acked_seq is not meaningful, and the gateway must not interpret a
+  // sequence-number jump on this stream as lost events. See ADR-0010.
+  bool durable_resume = 4;
 }
 
 message DetectionEvent {

@@ -99,6 +99,17 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
   grpc::Status Connect(grpc::ServerContext*, grpc::ServerReaderWriter<GatewayMessage, AgentMessage>* stream) override {
     std::string device_id;
     std::uint64_t last_seq = 0, received = 0, duplicates = 0, gap_events = 0;
+    // See ADR-0010 / ingest.proto's Hello.durable_resume: true means
+    // last_seq (seeded from Hello.last_acked_seq) is trustworthy resume
+    // state, so a seq jump on the FIRST detection after Hello is a real
+    // gap. false means the device told us up front it has no durable
+    // memory -- the first detection after such a Hello resyncs last_seq to
+    // whatever seq that detection carries, with no gap counted, since a
+    // "gap" against state the device itself said was meaningless isn't a
+    // real gap. Detections AFTER that resync are checked normally either
+    // way: a real gap mid-stream is still a real gap.
+    bool durable_resume = true;
+    bool awaiting_resync = false;
 #ifdef RIDGELINE_HAVE_KAFKA
     std::uint64_t kafka_published = 0, kafka_failed = 0;
 #endif
@@ -110,6 +121,8 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
           if (msg.hello().device_id().empty()) return {grpc::StatusCode::INVALID_ARGUMENT, "hello.device_id is required"};
           device_id = msg.hello().device_id();
           last_seq = msg.hello().last_acked_seq();
+          durable_resume = msg.hello().durable_resume();
+          awaiting_resync = !durable_resume;
           std::fprintf(stderr, "[gateway] %s connected (resume after seq %llu)\n", device_id.c_str(),
                        static_cast<unsigned long long>(last_seq));
           break;
@@ -133,7 +146,16 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
               }
             }
 #endif
-            if (d.seq() != last_seq + 1) gap_events += d.seq() - last_seq - 1;
+            if (awaiting_resync) {
+              // First detection after a "no durable resume state" Hello:
+              // accept whatever seq it carries as the new baseline, with no
+              // gap penalty -- this is the ADR-0010 fix, verified by
+              // scripts/gap_detection_test.sh to both suppress the false
+              // gap here AND still catch a genuine mid-stream gap below.
+              awaiting_resync = false;
+            } else if (d.seq() != last_seq + 1) {
+              gap_events += d.seq() - last_seq - 1;
+            }
             last_seq = d.seq(); ++received;
             max_transit_ns = std::max(max_transit_ns, ridgeline::NowUnixNs() - d.emit_time_unix_ns());
           }

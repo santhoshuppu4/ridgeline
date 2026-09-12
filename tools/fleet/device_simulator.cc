@@ -132,6 +132,13 @@ class SimulatedDevice {
       ridgeline::v1::AgentMessage hello;
       hello.mutable_hello()->set_device_id(device_id_);
       hello.mutable_hello()->set_agent_version("simulator");
+      // Deliberately false: this simulator has no WAL (see file header --
+      // durability testing is chaos_test.sh's job, not this tool's), so its
+      // last_acked_seq (always 0, never set below) is not real resume
+      // state. This is exactly the case ADR-0010 fixes: without this flag,
+      // every reconnect looked like a false "lost" gap on the gateway even
+      // though zero real events were lost.
+      hello.mutable_hello()->set_durable_resume(false);
       bool ok = stream->Write(hello);
 
       auto next_send = Clock::now();
