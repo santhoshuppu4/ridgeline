@@ -23,3 +23,17 @@ if(RIDGELINE_WITH_KAFKA)
                                             Threads::Threads GTest::gtest_main)
   gtest_discover_tests(kafka_tests DISCOVERY_TIMEOUT 30)
 endif()
+
+if(RIDGELINE_WITH_REDIS)
+  add_executable(redis_tests redis/redis_hot_state_store_test.cc)
+  target_link_libraries(redis_tests PRIVATE ridgeline_redis ridgeline_ext_hiredis ridgeline_warnings
+                                            Threads::Threads GTest::gtest_main)
+  gtest_discover_tests(redis_tests DISCOVERY_TIMEOUT 30)
+endif()
+
+if(RIDGELINE_WITH_DYNAMODB)
+  add_executable(dynamodb_tests dynamodb/sigv4_signer_test.cc dynamodb/device_shadow_store_test.cc)
+  target_link_libraries(dynamodb_tests PRIVATE ridgeline_dynamodb nlohmann_json::nlohmann_json ridgeline_warnings
+                                               Threads::Threads GTest::gtest_main)
+  gtest_discover_tests(dynamodb_tests DISCOVERY_TIMEOUT 30)
+endif()

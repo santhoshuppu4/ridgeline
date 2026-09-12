@@ -1,0 +1,3 @@
+add_library(ridgeline_redis STATIC src/redis_hot_state_store.cc)
+target_include_directories(ridgeline_redis PUBLIC include)
+target_link_libraries(ridgeline_redis PUBLIC ridgeline_core PRIVATE ridgeline_ext_hiredis ridgeline_warnings)

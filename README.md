@@ -60,7 +60,7 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 1b-iii** — agent `--video` mode: real pipeline -> gRPC, shared `EdgePipeline` component
 - [x] **Phase 1c** — write-ahead log, crash replay, kill -9 chaos test with identity oracle, fuzzed record parser
 - [x] **Phase 1d-i** — Kafka event backbone: gateway publishes before ack, tested against librdkafka's real mock protocol, standalone mock-broker tool for Docker-free dev
-- [ ] **Phase 1d-ii** — DynamoDB device shadow, Redis hot state
+- [x] **Phase 1d-ii** — Redis hot state (real redis-server tested), DynamoDB device shadow (hand-rolled SigV4, optimistic concurrency, fake-transport tested)
 - [ ] **Phase 2** — device simulator, config reconciliation, benchmarks
 - [ ] **Phase 3** — mTLS device identity, multi-tenancy, rate limiting, signed OTA
 - [ ] **Phase 4** — weather fusion, alert engine, Terraform
@@ -111,6 +111,33 @@ docker compose -f deploy/docker-compose.yml up -d
 
 See `context/adr/0007-kafka-event-backbone.md`, including a real use-after-free
 bug found and fixed while building this.
+
+## Phase 1d-ii: Redis hot state + DynamoDB device shadow
+
+```bash
+sudo apt-get install -y redis-server libhiredis-dev libcurl4-openssl-dev nlohmann-json3-dev
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_WITH_REDIS=ON -DRIDGELINE_WITH_DYNAMODB=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Redis tests run against a real `redis-server` subprocess. DynamoDB tests
+verify SigV4 signing (cross-checked against an independent Python
+implementation) and request/response logic via an injected fake transport
+-- no live DynamoDB needed for those. To verify against a real endpoint:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d   # brings up DynamoDB Local too
+./build/gateway/ridgeline_gateway --listen=0.0.0.0:50051 \
+  --redis-host=localhost --redis-port=6379 \
+  --dynamodb-endpoint=http://localhost:8000 --dynamodb-region=us-west-2 \
+  --dynamodb-access-key=local --dynamodb-secret-key=local
+```
+
+See `context/adr/0008-hot-state-and-device-shadow.md`, including a real
+gateway-availability bug found and fixed (Redis being down at startup used
+to take down the whole gateway, contradicting its own "best-effort"
+design).
 
 ## Honesty notes
 

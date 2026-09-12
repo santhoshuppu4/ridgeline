@@ -90,3 +90,35 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: End-to-end smoke test (agent -> gateway -> Kafka)
         run: ./scripts/kafka_gateway_smoke_test.sh build
+
+  redis:
+    name: redis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          ./scripts/install-deps.sh
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends redis-server libhiredis-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_BUILD_NET=OFF -DRIDGELINE_WITH_REDIS=ON
+      - name: Build
+        run: cmake --build build
+      - name: Tests (real redis-server subprocess)
+        run: ctest --test-dir build --output-on-failure
+
+  dynamodb:
+    name: dynamodb
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          ./scripts/install-deps.sh
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libcurl4-openssl-dev nlohmann-json3-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_BUILD_NET=OFF -DRIDGELINE_WITH_DYNAMODB=ON
+      - name: Build
+        run: cmake --build build
+      - name: Tests (SigV4 cross-check + fake-transport request logic)
+        run: ctest --test-dir build --output-on-failure
