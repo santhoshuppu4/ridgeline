@@ -69,8 +69,20 @@ if(RIDGELINE_WITH_ONNX)
   add_subdirectory(inference)
   add_subdirectory(capture)
 endif()
-if(RIDGELINE_WITH_ONNX OR RIDGELINE_WITH_KAFKA OR RIDGELINE_BUILD_NET)
-  add_subdirectory(tools)
-endif()
+# Always added: every individual tool inside tools/CMakeLists.txt already
+# gates itself by its own real dependency (RIDGELINE_WITH_ONNX for
+# ridgeline_edge, RIDGELINE_WITH_KAFKA for the mock broker,
+# RIDGELINE_BUILD_NET for the fleet simulator, etc.) -- exactly like every
+# block in cmake/Dependencies.cmake had to be fixed to do. ridgeline_ota_tool
+# needs none of those flags (only ridgeline_ota + ridgeline_core, both
+# unconditional), so gating the WHOLE subdirectory behind
+# ONNX/KAFKA/BUILD_NET meant a TSan-only build (which deliberately sets
+# RIDGELINE_BUILD_NET=OFF to dodge gRPC's uninstrumented internals -- see
+# ADR-0001/0007) never built ridgeline_ota_tool at all, and the OTA CI step
+# (which correctly has no matrix.net guard, since OTA doesn't need
+# networking) failed with "No such file or directory." Same class of bug,
+# same fix: don't gate a container by flags that only some of its contents
+# actually need.
+add_subdirectory(tools)
 add_subdirectory(tests)
 add_subdirectory(bench)
