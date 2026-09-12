@@ -30,6 +30,9 @@ jobs:
       - name: Chaos test (kill -9 agent, verify WAL durability)
         if: matrix.net == 'ON'
         run: ./scripts/chaos_test.sh build
+      - name: Fleet simulator correctness check
+        if: matrix.net == 'ON'
+        run: ./scripts/fleet_smoke_test.sh build
 
   # Phase 1b-ii: real ONNX Runtime inference + OpenCV video decode.
   # Separate job because it downloads ~12MB of pinned, checksum-verified

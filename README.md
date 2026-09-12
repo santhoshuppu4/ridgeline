@@ -61,7 +61,7 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 1c** — write-ahead log, crash replay, kill -9 chaos test with identity oracle, fuzzed record parser
 - [x] **Phase 1d-i** — Kafka event backbone: gateway publishes before ack, tested against librdkafka's real mock protocol, standalone mock-broker tool for Docker-free dev
 - [x] **Phase 1d-ii** — Redis hot state (real redis-server tested), DynamoDB device shadow (hand-rolled SigV4, optimistic concurrency, fake-transport tested)
-- [ ] **Phase 2** — device simulator, config reconciliation, benchmarks
+- [x] **Phase 2** — fleet device simulator (thread-per-connection measured: 161 threads/150 devices; a real reconnect-vs-gap-tracking bug found and documented)
 - [ ] **Phase 3** — mTLS device identity, multi-tenancy, rate limiting, signed OTA
 - [ ] **Phase 4** — weather fusion, alert engine, Terraform
 
@@ -138,6 +138,23 @@ See `context/adr/0008-hot-state-and-device-shadow.md`, including a real
 gateway-availability bug found and fixed (Redis being down at startup used
 to take down the whole gateway, contradicting its own "best-effort"
 design).
+
+## Phase 2: fleet device simulator
+
+```bash
+cmake --build build --target ridgeline_device_simulator
+./build/gateway/ridgeline_gateway --listen=127.0.0.1:50051 &
+./build/tools/ridgeline_device_simulator --gateway=127.0.0.1:50051 --devices=500 --duration-s=30 --rate-hz=2 --disconnect-every-s=15
+```
+
+`scripts/fleet_smoke_test.sh` runs a small, deterministic correctness check
+in CI (10 devices, no fault injection, every sent event must be acked). Real
+throughput/latency/thread-count numbers need real multi-core hardware --
+this project's own sandbox has one CPU core, which is exactly why those
+numbers aren't reported from CI. See `context/adr/0009-fleet-device-simulator.md`,
+including a real design gap found: the gateway currently can't distinguish
+a device that reconnected without WAL-backed resume state from one that
+actually lost events.
 
 ## Honesty notes
 

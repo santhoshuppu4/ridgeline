@@ -144,6 +144,8 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
         case AgentMessage::kHeartbeat: {
           if (device_id.empty()) return {grpc::StatusCode::FAILED_PRECONDITION, "hello must be first"};
           const auto& hb = msg.heartbeat();
+          (void)hb;  // Only read when Redis and/or DynamoDB integrations are compiled in (below); otherwise heartbeats
+                     // are just validated (hello must precede them) and don't need to hold onto the payload.
 #ifdef RIDGELINE_HAVE_REDIS
           if (integrations_.redis != nullptr) {
             ridgeline::DeviceHotState hot;
@@ -209,7 +211,7 @@ int main(int argc, char** argv) {
 #endif
   for (int i = 1; i < argc; ++i) {
     std::string_view arg{argv[i]};
-    auto value = [&](std::string_view key) -> const char* {
+    [[maybe_unused]] auto value = [&](std::string_view key) -> const char* {
       return arg.substr(0, key.size()) == key ? argv[i] + key.size() : nullptr;
     };
     if (arg.rfind("--listen=", 0) == 0) listen = std::string{arg.substr(9)};
