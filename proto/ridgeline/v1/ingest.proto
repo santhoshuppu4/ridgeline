@@ -14,6 +14,12 @@ message Hello {
   // last_acked_seq is not meaningful, and the gateway must not interpret a
   // sequence-number jump on this stream as lost events. See ADR-0010.
   bool durable_resume = 4;
+  // Which tenant this device belongs to. Cross-checked (ADR-0013) against
+  // the client certificate's Common Name, which encodes identity as
+  // "tenant_id:device_id" (see scripts/generate_test_certs.sh) -- the same
+  // "verify a claimed fact against a cryptographic one" pattern ADR-0011
+  // used for device_id alone, extended to cover tenant boundaries too.
+  string tenant_id = 5;
 }
 
 message DetectionEvent {

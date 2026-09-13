@@ -49,7 +49,7 @@ timeout 6 "$BUILD_DIR/agent/ridgeline_agent" --gateway="127.0.0.1:$PORT" --devic
   --tls-ca="$CERT_DIR/ca.crt" --tls-cert="$CERT_DIR/cam-0002.crt" --tls-key="$CERT_DIR/cam-0002.key" \
   >"$LOG_DIR/agent2.log" 2>&1 || true
 kill -INT "$GW_PID"; wait "$GW_PID" 2>/dev/null || true
-if ! grep -q "REJECTED: cert CN='cam-0002' does not match claimed device_id='cam-0001'" "$LOG_DIR/gateway.log"; then
+if ! grep -q "REJECTED: cert CN='cam-0002' does not match claimed identity='cam-0001'" "$LOG_DIR/gateway.log"; then
   echo "FAIL: impersonation attempt should be rejected"; cat "$LOG_DIR/gateway.log"; exit 1
 fi
 if grep -q "cam-0001 connected" "$LOG_DIR/gateway.log"; then

@@ -5,19 +5,19 @@
 # real CA (no HSM, no revocation, a long-lived CA key sitting on disk in
 # plaintext). See context/adr/0011 for what a production version would need.
 #
-# Each device certificate's Common Name (CN) IS the device_id. That's the
-# whole point: the gateway can cross-check the CN gRPC's mTLS handshake
-# already cryptographically verified against the device_id the agent claims
-# in its Hello message, so a device can no longer just SAY it's "cam-5" --
-# it has to hold cam-5's private key.
+# Each device certificate's Common Name (CN) encodes BOTH identities the
+# gateway needs to verify cryptographically: "tenant_id:device_id" (ADR-0013
+# extends ADR-0011's device-only identity check to cover tenant boundaries
+# too). A device can no longer just SAY it belongs to tenant A -- it has to
+# hold a cert whose CN says so.
 #
 # Usage:
-#   ./scripts/generate_test_certs.sh /tmp/ridgeline-certs cam-0001 cam-0002 ...
+#   ./scripts/generate_test_certs.sh /tmp/ridgeline-certs tenant-a:cam-0001 tenant-a:cam-0002 tenant-b:cam-0001
 set -euo pipefail
 
-OUT="${1:?usage: $0 <output-dir> [device-id ...]}"
+OUT="${1:?usage: $0 <output-dir> [tenant_id:device_id ...]}"
 shift
-DEVICE_IDS=("$@")
+DEVICE_SPECS=("$@")
 
 mkdir -p "$OUT"
 cd "$OUT"
@@ -35,13 +35,16 @@ openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
   -out server.crt 2>/dev/null
 rm -f server.csr
 
-for device_id in "${DEVICE_IDS[@]}"; do
-  echo "== Device cert: $device_id =="
-  openssl genrsa -out "${device_id}.key" 2048 2>/dev/null
-  openssl req -new -key "${device_id}.key" -subj "/O=Ridgeline/CN=${device_id}" -out "${device_id}.csr"
-  openssl x509 -req -in "${device_id}.csr" -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -days 825 -sha256 -out "${device_id}.crt" 2>/dev/null
-  rm -f "${device_id}.csr"
+for spec in "${DEVICE_SPECS[@]}"; do
+  # spec is "tenant_id:device_id" -- becomes the cert's CN verbatim, and a
+  # filename-safe version (":" -> "_") for the key/cert files themselves.
+  file_stem="${spec//:/_}"
+  echo "== Device cert: $spec (files: ${file_stem}.key / .crt) =="
+  openssl genrsa -out "${file_stem}.key" 2048 2>/dev/null
+  openssl req -new -key "${file_stem}.key" -subj "/O=Ridgeline/CN=${spec}" -out "${file_stem}.csr"
+  openssl x509 -req -in "${file_stem}.csr" -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -days 825 -sha256 -out "${file_stem}.crt" 2>/dev/null
+  rm -f "${file_stem}.csr"
 done
 
 echo

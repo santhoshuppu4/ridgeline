@@ -64,7 +64,7 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 2** — fleet device simulator (thread-per-connection measured: 161 threads/150 devices; a real reconnect-vs-gap-tracking bug found and documented)
 - [x] **Phase 3-i** — mTLS device identity: cert CN cross-checked against claimed device_id, verified against real impersonation attempts; found and fixed an unrelated fake-detection rate-loop bug along the way
 - [x] **Phase 4** — config reconciliation (real live rate/K-of-N changes, both agent modes) and signed OTA manifest trust (Ed25519, hand-rolled, 4 mutation tests); full binary distribution/A-B-swap/watchdog rollback scoped out explicitly
-- [ ] **Phase 3-ii** — multi-tenancy, rate limiting
+- [x] **Phase 3-ii** — multi-tenancy (tenant identity bound to cert CN, isolation verified both ways) and per-tenant rate limiting; found and fixed the same false-gap mistake as ADR-0010, this time within a single stream
 - [ ] **Phase 5** — weather fusion, alert engine, Terraform
 
 ## Phase 1b-ii: real inference (optional build)
@@ -198,6 +198,22 @@ real end-to-end checks. See `context/adr/0012-config-reconciliation-and-ota-mani
 for exactly what signed OTA does and does not cover here -- binary
 download, A/B partition swap, and watchdog rollback are explicitly
 out of scope for this phase.
+
+## Phase 3-ii: multi-tenancy + rate limiting
+
+```bash
+./scripts/generate_test_certs.sh /tmp/certs tenant-a:cam-0001 tenant-b:cam-0001
+./build/gateway/ridgeline_gateway --listen=0.0.0.0:50051 \
+  --tls-ca=/tmp/certs/ca.crt --tls-cert=/tmp/certs/server.crt --tls-key=/tmp/certs/server.key \
+  --rate-limit-capacity=50 --rate-limit-per-second=20
+./build/agent/ridgeline_agent --gateway=127.0.0.1:50051 --device-id=cam-0001 --tenant-id=tenant-a --state-dir=/tmp/t \
+  --tls-ca=/tmp/certs/ca.crt --tls-cert=/tmp/certs/tenant-a_cam-0001.crt --tls-key=/tmp/certs/tenant-a_cam-0001.key
+```
+
+`scripts/multi_tenancy_test.sh` and `scripts/rate_limit_test.sh` run the
+real end-to-end checks. See `context/adr/0013-multi-tenancy-and-rate-limiting.md`,
+including a false-"lost"-events bug found in the rate limiter -- the same
+mistake ADR-0010 fixed for reconnects, this time inside a single stream.
 
 ## Honesty notes
 

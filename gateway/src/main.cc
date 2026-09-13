@@ -28,11 +28,13 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include "ridgeline/time.h"
+#include "ridgeline/token_bucket.h"
 #include "ridgeline/v1/ingest.grpc.pb.h"
 
 #ifdef RIDGELINE_HAVE_KAFKA
@@ -78,6 +80,8 @@ struct GatewayIntegrations {
   ridgeline::DeviceShadowStore* shadow_store = nullptr;
 #endif
   std::string desired_configs_path;  // Empty = config reconciliation disabled. See ADR-0012.
+  double rate_limit_capacity = 0;      // 0 = rate limiting disabled entirely. See ADR-0013.
+  double rate_limit_tokens_per_second = 0;
 };
 
 // Parses the simple desired-config file format:
@@ -146,7 +150,8 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
 
   grpc::Status Connect(grpc::ServerContext* context, grpc::ServerReaderWriter<GatewayMessage, AgentMessage>* stream) override {
     std::string device_id;
-    std::uint64_t last_seq = 0, received = 0, duplicates = 0, gap_events = 0;
+    std::string tenant_id;  // Empty for a legacy/single-tenant device. See ADR-0013.
+    std::uint64_t last_seq = 0, received = 0, duplicates = 0, gap_events = 0, rate_limited = 0;
     // See ADR-0010 / ingest.proto's Hello.durable_resume: true means
     // last_seq (seeded from Hello.last_acked_seq) is trustworthy resume
     // state, so a seq jump on the FIRST detection after Hello is a real
@@ -167,33 +172,42 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
       switch (msg.payload_case()) {
         case AgentMessage::kHello:
           if (msg.hello().device_id().empty()) return {grpc::StatusCode::INVALID_ARGUMENT, "hello.device_id is required"};
-          // mTLS identity cross-check (ADR-0011): if the connection is
-          // authenticated via a client certificate, its Common Name is a
-          // cryptographic fact -- the peer proved it holds that cert's
-          // private key. If Hello claims a different device_id, the agent
-          // is either misconfigured or attempting to impersonate another
-          // device; either way, reject it here rather than trusting a
-          // self-reported string, which is exactly the gap ADR-0010 noted
-          // as needing an explicit decision. On a plaintext (non-mTLS)
-          // connection, FindPropertyValues returns empty and this check is
-          // a no-op -- backward compatible with every non-TLS test/script
-          // already in this project.
+          // mTLS identity cross-check (ADR-0011, extended by ADR-0013 for
+          // tenant identity): if the connection is authenticated via a
+          // client certificate, its Common Name is a cryptographic fact --
+          // the peer proved it holds that cert's private key. Certificates
+          // minted by generate_test_certs.sh encode CN as
+          // "tenant_id:device_id" when a tenant is issued, or just
+          // "device_id" for a legacy/single-tenant cert. The expected CN
+          // is constructed to match whichever shape the AGENT actually
+          // claims, so a device with a single-tenant cert can't be tricked
+          // into a tenant context it was never issued for, and a
+          // tenant-scoped cert can't be presented while claiming a
+          // DIFFERENT tenant_id than the one baked into it. On a plaintext
+          // (non-mTLS) connection, FindPropertyValues returns empty and
+          // this check is a no-op -- backward compatible with every
+          // non-TLS test/script already in this project.
           {
             const auto cn_values = context->auth_context()->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME);
             if (!cn_values.empty()) {
               const std::string cert_cn(cn_values[0].data(), cn_values[0].size());
-              if (cert_cn != msg.hello().device_id()) {
-                std::fprintf(stderr, "[gateway] REJECTED: cert CN='%s' does not match claimed device_id='%s'\n",
-                             cert_cn.c_str(), msg.hello().device_id().c_str());
-                return {grpc::StatusCode::PERMISSION_DENIED, "device_id does not match client certificate identity"};
+              const std::string expected_cn = msg.hello().tenant_id().empty()
+                                                  ? msg.hello().device_id()
+                                                  : msg.hello().tenant_id() + ":" + msg.hello().device_id();
+              if (cert_cn != expected_cn) {
+                std::fprintf(stderr, "[gateway] REJECTED: cert CN='%s' does not match claimed identity='%s'\n",
+                             cert_cn.c_str(), expected_cn.c_str());
+                return {grpc::StatusCode::PERMISSION_DENIED, "claimed identity does not match client certificate"};
               }
             }
           }
           device_id = msg.hello().device_id();
+          tenant_id = msg.hello().tenant_id();
           last_seq = msg.hello().last_acked_seq();
           durable_resume = msg.hello().durable_resume();
           awaiting_resync = !durable_resume;
-          std::fprintf(stderr, "[gateway] %s connected (resume after seq %llu)\n", device_id.c_str(),
+          std::fprintf(stderr, "[gateway] %s%s connected (resume after seq %llu)\n",
+                       tenant_id.empty() ? "" : (tenant_id + ":").c_str(), device_id.c_str(),
                        static_cast<unsigned long long>(last_seq));
           break;
         case AgentMessage::kDetection: {
@@ -206,6 +220,11 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
           if (d.seq() <= last_seq) {
             ++duplicates;
           } else {
+            const std::string rate_key = tenant_id.empty() ? ("device:" + device_id) : ("tenant:" + tenant_id);
+            if (!CheckRateLimit(rate_key)) {
+              ++rate_limited;
+              break;  // No ack this round; agent's WAL-backed resend (ADR-0006) will retry once the bucket refills.
+            }
 #ifdef RIDGELINE_HAVE_KAFKA
             if (integrations_.kafka != nullptr) {
               if (integrations_.kafka->PublishSync(device_id, d.SerializeAsString())) {
@@ -279,10 +298,31 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
           return {grpc::StatusCode::INVALID_ARGUMENT, "empty AgentMessage"};
       }
     }
-    std::fprintf(stderr, "[gateway] %s disconnected: received=%llu duplicates=%llu lost=%llu max_transit=%.2fms",
-                 device_id.empty() ? "<no hello>" : device_id.c_str(), static_cast<unsigned long long>(received),
-                 static_cast<unsigned long long>(duplicates), static_cast<unsigned long long>(gap_events),
-                 static_cast<double>(max_transit_ns) / 1e6);
+    const std::string logged_identity =
+        device_id.empty() ? "<no hello>" : (tenant_id.empty() ? device_id : tenant_id + ":" + device_id);
+    // gap_events (raw) counts every skipped seq value between accepted
+    // detections, from ANY cause -- including this connection's own
+    // rate-limit rejections, which are a deliberate policy decision, not
+    // data loss. Reporting the raw number as "lost" would repeat exactly
+    // the mistake ADR-0010 fixed for reconnects (conflating an EXPLAINED
+    // gap with a real one), just within a single stream instead of across
+    // reconnects: a device throttled by its own tenant's rate limit would
+    // look identical in this log to one that's actually losing events over
+    // a bad link. Since every skipped seq in this connection is either a
+    // rate-limit rejection or unexplained (no other cause exists within
+    // one synchronous stream -- gRPC delivers what's written, in order),
+    // subtracting the known rate_limited count isolates the genuinely
+    // unexplained remainder. Clamped at zero: rate_limited can legitimately
+    // exceed the raw gap sum (trailing rejections after the last accepted
+    // detection never get tallied into gap_events at all, since nothing
+    // arrives afterward to compute a jump against) -- that's not a bug,
+    // just means those trailing skips are already fully accounted for by
+    // rate_limited alone.
+    const std::uint64_t attributed_lost = gap_events > rate_limited ? gap_events - rate_limited : 0;
+    std::fprintf(stderr, "[gateway] %s disconnected: received=%llu duplicates=%llu lost=%llu rate_limited=%llu max_transit=%.2fms",
+                 logged_identity.c_str(), static_cast<unsigned long long>(received),
+                 static_cast<unsigned long long>(duplicates), static_cast<unsigned long long>(attributed_lost),
+                 static_cast<unsigned long long>(rate_limited), static_cast<double>(max_transit_ns) / 1e6);
 #ifdef RIDGELINE_HAVE_KAFKA
     if (integrations_.kafka != nullptr) {
       std::fprintf(stderr, " kafka_published=%llu kafka_failed=%llu", static_cast<unsigned long long>(kafka_published),
@@ -295,6 +335,28 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
 
  private:
   GatewayIntegrations integrations_;
+
+  // Rate limiting (ADR-0013): one bucket per tenant (or per device_id, when
+  // a device has no tenant_id -- see the keying comment where this is used
+  // below). Shared across every concurrent connection this synchronous
+  // server handles, so a mutex guards it -- rate-limit checks happen at
+  // event rate (one per detection), not frame rate, so a plain mutex is
+  // fine here, same reasoning as the Outbox class in agent/src/main.cc.
+  std::mutex rate_limiter_mu_;
+  std::map<std::string, ridgeline::TokenBucket> rate_limiters_;
+
+  bool CheckRateLimit(const std::string& key) {
+    if (integrations_.rate_limit_capacity <= 0) return true;  // Disabled.
+    std::lock_guard<std::mutex> lock(rate_limiter_mu_);
+    auto it = rate_limiters_.find(key);
+    if (it == rate_limiters_.end()) {
+      it = rate_limiters_
+               .emplace(key, ridgeline::TokenBucket(integrations_.rate_limit_capacity,
+                                                    integrations_.rate_limit_tokens_per_second, ridgeline::NowUnixNs()))
+               .first;
+    }
+    return it->second.TryConsume(1.0, ridgeline::NowUnixNs());
+  }
 };
 }  // namespace
 
@@ -302,6 +364,8 @@ int main(int argc, char** argv) {
   std::string listen = "0.0.0.0:50051";
   std::string tls_ca, tls_cert, tls_key;  // All three required together to enable mTLS; see ADR-0011.
   std::string device_configs_path;  // See ADR-0012.
+  double rate_limit_capacity = 0;       // 0 = disabled. See ADR-0013.
+  double rate_limit_tokens_per_second = 0;
 #ifdef RIDGELINE_HAVE_KAFKA
   std::string kafka_brokers;
   std::string kafka_topic = "detections.v1";
@@ -329,6 +393,8 @@ int main(int argc, char** argv) {
     else if (auto vcert = value("--tls-cert=")) tls_cert = vcert;
     else if (auto vkey = value("--tls-key=")) tls_key = vkey;
     else if (auto vcfg = value("--device-configs=")) device_configs_path = vcfg;
+    else if (auto vrlc = value("--rate-limit-capacity=")) rate_limit_capacity = std::atof(vrlc);
+    else if (auto vrlr = value("--rate-limit-per-second=")) rate_limit_tokens_per_second = std::atof(vrlr);
 #ifdef RIDGELINE_HAVE_KAFKA
     else if (auto v = value("--kafka-brokers=")) kafka_brokers = v;
     else if (auto v2 = value("--kafka-topic=")) kafka_topic = v2;
@@ -414,6 +480,13 @@ int main(int argc, char** argv) {
 #endif
 
   integrations.desired_configs_path = device_configs_path;
+  integrations.rate_limit_capacity = rate_limit_capacity;
+  integrations.rate_limit_tokens_per_second = rate_limit_tokens_per_second;
+  if (rate_limit_capacity > 0) {
+    std::fprintf(stderr, "[gateway] rate limiting enabled: capacity=%.1f tokens_per_second=%.1f (per tenant, or per "
+                        "device if a connection has no tenant_id)\n",
+                 rate_limit_capacity, rate_limit_tokens_per_second);
+  }
   IngestServiceImpl service(integrations);
 
   grpc::ServerBuilder builder;

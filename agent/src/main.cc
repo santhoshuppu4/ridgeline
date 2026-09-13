@@ -65,6 +65,7 @@ void OnSignal(int) { g_stop.store(true); }
 struct Options {
   std::string gateway = "localhost:50051";
   std::string device_id = "cam-0001";
+  std::string tenant_id;  // Empty = single-tenant/legacy mode; see ADR-0013.
   double rate_hz = 5.0;          // Fake-detection mode only.
   int duration_s = 0;
   std::string state_dir;         // Default derived from device_id below.
@@ -100,6 +101,7 @@ Options ParseArgs(int argc, char** argv) {
     };
     if (auto v = value("--gateway=")) opt.gateway = v;
     else if (auto v2 = value("--device-id=")) opt.device_id = v2;
+    else if (auto vtenant = value("--tenant-id=")) opt.tenant_id = vtenant;
     else if (auto vca = value("--tls-ca=")) opt.tls_ca = vca;
     else if (auto vcert = value("--tls-cert=")) opt.tls_cert = vcert;
     else if (auto vkey = value("--tls-key=")) opt.tls_key = vkey;
@@ -459,6 +461,7 @@ int main(int argc, char** argv) {
     ridgeline::v1::AgentMessage hello_msg;
     auto* hello = hello_msg.mutable_hello();
     hello->set_device_id(opt.device_id);
+    hello->set_tenant_id(opt.tenant_id);
     hello->set_agent_version(RIDGELINE_VERSION);
     hello->set_last_acked_seq(wal.LastAcked());
     hello->set_durable_resume(true);  // The WAL makes last_acked_seq trustworthy resume state; see ADR-0010.
