@@ -258,5 +258,7 @@ two first.
 ## Honesty notes
 
 Performance numbers live in `BENCHMARKS.md` with hardware, commit, and
-method. Nothing here claims fleet scale — the device simulator that would
-justify that doesn't exist yet.
+method. Fleet-scale claims are backed by `ridgeline_device_simulator`
+(Phase 2) — 500 simulated devices, verified on real hardware, with the
+run's own thread-count and throughput numbers recorded in
+`BENCHMARKS.md`, not just asserted here.
