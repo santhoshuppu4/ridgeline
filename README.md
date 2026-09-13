@@ -65,7 +65,8 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 3-i** — mTLS device identity: cert CN cross-checked against claimed device_id, verified against real impersonation attempts; found and fixed an unrelated fake-detection rate-loop bug along the way
 - [x] **Phase 4** — config reconciliation (real live rate/K-of-N changes, both agent modes) and signed OTA manifest trust (Ed25519, hand-rolled, 4 mutation tests); full binary distribution/A-B-swap/watchdog rollback scoped out explicitly
 - [x] **Phase 3-ii** — multi-tenancy (tenant identity bound to cert CN, isolation verified both ways) and per-tenant rate limiting; found and fixed the same false-gap mistake as ADR-0010, this time within a single stream
-- [ ] **Phase 5** — weather fusion, alert engine, Terraform
+- [x] **Phase 5-i** — weather fusion + alert engine: injectable-transport weather client (8 tests, no network needed), pure-function alert severity with mutation-tested escalation logic (14 tests), graceful degradation verified in a real running gateway against a genuinely unreachable API
+- [ ] **Phase 5-ii** — Terraform on AWS
 
 ## Phase 1b-ii: real inference (optional build)
 
@@ -214,6 +215,28 @@ out of scope for this phase.
 real end-to-end checks. See `context/adr/0013-multi-tenancy-and-rate-limiting.md`,
 including a false-"lost"-events bug found in the rate limiter -- the same
 mistake ADR-0010 fixed for reconnects, this time inside a single stream.
+
+## Phase 5-i: weather fusion + alert engine
+
+```bash
+./build/gateway/ridgeline_gateway --listen=0.0.0.0:50051 --weather-lat=34.05 --weather-lon=-118.24 --weather-refresh-s=300
+```
+
+Every confirmed detection gets fused with the most recent weather reading
+into an `ALERT severity=...` log line. With no `--weather-lat`/`--weather-lon`,
+behavior is unchanged (weather fusion is off by default). Missing or
+unreachable weather data never suppresses an alert -- confirmed directly:
+this project's own sandbox cannot reach the real weather API at all (a
+direct curl returns "Host not in allowlist"), and running the gateway with
+weather enabled there still produced correctly-tiered alerts from
+confidence alone.
+
+`scripts/weather_test.sh` exercises a REAL live round trip against
+Open-Meteo -- it needs genuine internet access this sandbox doesn't have,
+so it's written to run in CI (GitHub Actions runners have normal internet
+access) or on your own machine, not here. See
+`context/adr/0014-weather-fusion-and-alert-engine.md` for the full split
+between what's verified here and what needs real infrastructure.
 
 ## Honesty notes
 

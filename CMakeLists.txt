@@ -11,6 +11,7 @@ option(RIDGELINE_WITH_ONNX "Build ONNX Runtime inference + OpenCV video capture 
 option(RIDGELINE_WITH_KAFKA "Build the Kafka event-backbone integration (Phase 1d-i)" OFF)
 option(RIDGELINE_WITH_REDIS "Build the Redis hot-state integration (Phase 1d-ii)" OFF)
 option(RIDGELINE_WITH_DYNAMODB "Build the DynamoDB device-shadow integration (Phase 1d-ii)" OFF)
+option(RIDGELINE_WITH_WEATHER "Build the weather fusion + alert engine integration (Phase 5)" OFF)
 set(RIDGELINE_SANITIZE "" CACHE STRING "Sanitizer build: '', 'address' (ASan+UBSan), or 'thread' (TSan)")
 
 include(cmake/Sanitizers.cmake)
@@ -33,6 +34,10 @@ if(RIDGELINE_WITH_DYNAMODB AND RIDGELINE_SANITIZE STREQUAL "thread")
   message(FATAL_ERROR "RIDGELINE_WITH_DYNAMODB is not supported with TSan: libcurl's system dependencies "
                       "are uninstrumented and produce false-positive race reports.")
 endif()
+if(RIDGELINE_WITH_WEATHER AND RIDGELINE_SANITIZE STREQUAL "thread")
+  message(FATAL_ERROR "RIDGELINE_WITH_WEATHER is not supported with TSan: same libcurl reasoning as "
+                      "RIDGELINE_WITH_DYNAMODB above.")
+endif()
 
 # IMPORTANT ORDERING: cmake/Dependencies.cmake defines RIDGELINE_MODEL_PATH
 # (among other cache vars), which agent/CMakeLists.txt consumes to set the
@@ -44,7 +49,7 @@ endif()
 # ordering bugs like this produce no error at configure or build time, only
 # at runtime, which is exactly why this dependency is called out explicitly
 # here rather than left to be rediscovered.
-if(RIDGELINE_WITH_ONNX OR RIDGELINE_WITH_KAFKA OR RIDGELINE_WITH_REDIS OR RIDGELINE_WITH_DYNAMODB)
+if(RIDGELINE_WITH_ONNX OR RIDGELINE_WITH_KAFKA OR RIDGELINE_WITH_REDIS OR RIDGELINE_WITH_DYNAMODB OR RIDGELINE_WITH_WEATHER)
   include(cmake/Dependencies.cmake)
 endif()
 find_package(OpenSSL REQUIRED)  # ridgeline_ota always needs this; unconditional, not gated by any RIDGELINE_WITH_* flag.
@@ -60,6 +65,9 @@ endif()
 if(RIDGELINE_WITH_DYNAMODB)
   add_subdirectory(dynamodb)
 endif()
+if(RIDGELINE_WITH_WEATHER)
+  add_subdirectory(weather)
+endif()
 if(RIDGELINE_BUILD_NET)
   add_subdirectory(proto)
   add_subdirectory(agent)
@@ -69,6 +77,20 @@ if(RIDGELINE_WITH_ONNX)
   add_subdirectory(inference)
   add_subdirectory(capture)
 endif()
+# Always added: every individual tool inside tools/CMakeLists.txt already
+# gates itself by its own real dependency (RIDGELINE_WITH_ONNX for
+# ridgeline_edge, RIDGELINE_WITH_KAFKA for the mock broker,
+# RIDGELINE_BUILD_NET for the fleet simulator, etc.) -- exactly like every
+# block in cmake/Dependencies.cmake had to be fixed to do. ridgeline_ota_tool
+# needs none of those flags (only ridgeline_ota + ridgeline_core, both
+# unconditional), so gating the WHOLE subdirectory behind
+# ONNX/KAFKA/BUILD_NET meant a TSan-only build (which deliberately sets
+# RIDGELINE_BUILD_NET=OFF to dodge gRPC's uninstrumented internals -- see
+# ADR-0001/0007) never built ridgeline_ota_tool at all, and the OTA CI step
+# (which correctly has no matrix.net guard, since OTA doesn't need
+# networking) failed with "No such file or directory." Same class of bug,
+# same fix: don't gate a container by flags that only some of its contents
+# actually need.
 add_subdirectory(tools)
 add_subdirectory(tests)
 add_subdirectory(bench)

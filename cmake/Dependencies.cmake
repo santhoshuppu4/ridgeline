@@ -111,3 +111,12 @@ if(RIDGELINE_WITH_DYNAMODB)
   find_package(nlohmann_json REQUIRED)
   find_package(OpenSSL REQUIRED)
 endif()
+
+if(RIDGELINE_WITH_WEATHER)
+  # libcurl + nlohmann-json: HTTP GET transport and JSON parsing for the
+  # weather client. Independent of RIDGELINE_WITH_DYNAMODB -- both happen
+  # to need curl+json, but weather fusion has nothing to do with device
+  # shadows, so it gets its own flag rather than piggybacking on DynamoDB's.
+  find_package(CURL REQUIRED)
+  find_package(nlohmann_json REQUIRED)
+endif()

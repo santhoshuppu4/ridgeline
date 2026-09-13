@@ -48,6 +48,11 @@
 #include "ridgeline/curl_http_transport.h"
 #include "ridgeline/device_shadow_store.h"
 #endif
+#ifdef RIDGELINE_HAVE_WEATHER
+#include "ridgeline/alert_engine.h"
+#include "ridgeline/curl_get_transport.h"
+#include "ridgeline/weather_client.h"
+#endif
 
 namespace {
 using namespace std::chrono_literals;
@@ -62,6 +67,63 @@ std::string ReadFileOrDie(const std::string& path) {
   if (!in) { std::fprintf(stderr, "[gateway] cannot read %s\n", path.c_str()); std::exit(1); }
   return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
+
+#ifdef RIDGELINE_HAVE_WEATHER
+// Background-refreshed weather snapshot (ADR-0014): a dedicated thread
+// polls the real API every `refresh_s`, and Current() returns the most
+// recent successful reading via a plain mutex -- called once per accepted
+// detection, which is nowhere near hot enough to need anything fancier.
+//
+// ON A FAILED REFRESH: the PREVIOUS successful reading is kept, not
+// cleared to nullopt -- a transient API hiccup shouldn't blank out weather
+// context for every detection in between refreshes. This does mean a
+// reading can go stale if the API stays down a long time; this phase does
+// not track or enforce a max-age cutoff on that, which is a real,
+// deliberate simplification worth revisiting if this ever needs to be
+// trusted for longer outages.
+class WeatherCache {
+ public:
+  WeatherCache(std::shared_ptr<ridgeline::WeatherClient> client, double lat, double lon, int refresh_s)
+      : client_(std::move(client)), lat_(lat), lon_(lon), refresh_s_(std::max(refresh_s, 1)) {}
+  ~WeatherCache() { Stop(); }
+  WeatherCache(const WeatherCache&) = delete;
+  WeatherCache& operator=(const WeatherCache&) = delete;
+
+  void Start() {
+    thread_ = std::thread([this] {
+      while (!stop_.load()) {
+        const auto result = client_->FetchCurrent(lat_, lon_);
+        if (result.has_value()) {
+          std::lock_guard<std::mutex> lock(mu_);
+          current_ = result;
+          std::fprintf(stderr, "[gateway] weather updated: temp=%.1fC humidity=%.0f%% wind=%.1fkm/h\n",
+                       result->temperature_c, result->relative_humidity_pct, result->wind_speed_kmh);
+        } else {
+          std::fprintf(stderr, "[gateway] WARNING: weather fetch failed (keeping previous reading if any)\n");
+        }
+        for (int i = 0; i < refresh_s_ * 10 && !stop_.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    });
+  }
+  void Stop() {
+    stop_.store(true);
+    if (thread_.joinable()) thread_.join();
+  }
+  std::optional<ridgeline::WeatherConditions> Current() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return current_;
+  }
+
+ private:
+  std::shared_ptr<ridgeline::WeatherClient> client_;
+  double lat_, lon_;
+  int refresh_s_;
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+  std::mutex mu_;
+  std::optional<ridgeline::WeatherConditions> current_;
+};
+#endif
 
 // Bundles every optional external integration into one struct so
 // IngestServiceImpl's constructor stays a single, ordinary parameter list --
@@ -80,6 +142,9 @@ struct GatewayIntegrations {
   ridgeline::DeviceShadowStore* shadow_store = nullptr;
 #endif
   std::string desired_configs_path;  // Empty = config reconciliation disabled. See ADR-0012.
+#ifdef RIDGELINE_HAVE_WEATHER
+  WeatherCache* weather_cache = nullptr;  // nullptr = weather fusion disabled. See ADR-0014.
+#endif
   double rate_limit_capacity = 0;      // 0 = rate limiting disabled entirely. See ADR-0013.
   double rate_limit_tokens_per_second = 0;
 };
@@ -247,6 +312,17 @@ class IngestServiceImpl final : public ridgeline::v1::IngestService::Service {
             }
             last_seq = d.seq(); ++received;
             max_transit_ns = std::max(max_transit_ns, ridgeline::NowUnixNs() - d.emit_time_unix_ns());
+#ifdef RIDGELINE_HAVE_WEATHER
+            if (integrations_.weather_cache != nullptr) {
+              const auto weather = integrations_.weather_cache->Current();
+              const auto severity = ridgeline::ComputeAlertSeverity(d.confidence(), weather);
+              if (severity != ridgeline::AlertSeverity::kNone) {
+                std::fprintf(stderr, "[gateway] ALERT severity=%s device=%s confidence=%.2f%s\n",
+                             ridgeline::ToString(severity).c_str(), device_id.c_str(),
+                             static_cast<double>(d.confidence()), weather.has_value() ? "" : " (no weather data yet)");
+              }
+            }
+#endif
           }
           GatewayMessage ack; ack.mutable_ack()->set_up_to_seq(last_seq);
           if (!stream->Write(ack)) return {grpc::StatusCode::UNAVAILABLE, "failed to write ack"};
@@ -364,6 +440,11 @@ int main(int argc, char** argv) {
   std::string listen = "0.0.0.0:50051";
   std::string tls_ca, tls_cert, tls_key;  // All three required together to enable mTLS; see ADR-0011.
   std::string device_configs_path;  // See ADR-0012.
+#ifdef RIDGELINE_HAVE_WEATHER
+  double weather_lat = 0.0, weather_lon = 0.0;
+  bool weather_enabled = false;
+  int weather_refresh_s = 300;  // 5 minutes: frequent enough to matter, far below any reasonable API rate limit.
+#endif
   double rate_limit_capacity = 0;       // 0 = disabled. See ADR-0013.
   double rate_limit_tokens_per_second = 0;
 #ifdef RIDGELINE_HAVE_KAFKA
@@ -393,6 +474,11 @@ int main(int argc, char** argv) {
     else if (auto vcert = value("--tls-cert=")) tls_cert = vcert;
     else if (auto vkey = value("--tls-key=")) tls_key = vkey;
     else if (auto vcfg = value("--device-configs=")) device_configs_path = vcfg;
+#ifdef RIDGELINE_HAVE_WEATHER
+    else if (auto vlat = value("--weather-lat=")) { weather_lat = std::atof(vlat); weather_enabled = true; }
+    else if (auto vlon = value("--weather-lon=")) { weather_lon = std::atof(vlon); weather_enabled = true; }
+    else if (auto vref = value("--weather-refresh-s=")) weather_refresh_s = std::atoi(vref);
+#endif
     else if (auto vrlc = value("--rate-limit-capacity=")) rate_limit_capacity = std::atof(vrlc);
     else if (auto vrlr = value("--rate-limit-per-second=")) rate_limit_tokens_per_second = std::atof(vrlr);
 #ifdef RIDGELINE_HAVE_KAFKA
@@ -480,6 +566,18 @@ int main(int argc, char** argv) {
 #endif
 
   integrations.desired_configs_path = device_configs_path;
+#ifdef RIDGELINE_HAVE_WEATHER
+  std::unique_ptr<WeatherCache> weather_cache;
+  if (weather_enabled) {
+    auto transport = std::make_shared<ridgeline::CurlGetTransport>();
+    auto client = std::make_shared<ridgeline::WeatherClient>(transport);
+    weather_cache = std::make_unique<WeatherCache>(client, weather_lat, weather_lon, weather_refresh_s);
+    weather_cache->Start();
+    integrations.weather_cache = weather_cache.get();
+    std::fprintf(stderr, "[gateway] weather fusion enabled: lat=%.4f lon=%.4f refresh=%ds\n", weather_lat, weather_lon,
+                 weather_refresh_s);
+  }
+#endif
   integrations.rate_limit_capacity = rate_limit_capacity;
   integrations.rate_limit_tokens_per_second = rate_limit_tokens_per_second;
   if (rate_limit_capacity > 0) {

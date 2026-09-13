@@ -142,3 +142,21 @@ jobs:
         run: cmake --build build
       - name: Tests (SigV4 cross-check + fake-transport request logic)
         run: ctest --test-dir build --output-on-failure
+
+  weather:
+    name: weather
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          ./scripts/install-deps.sh
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libcurl4-openssl-dev nlohmann-json3-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_WITH_WEATHER=ON
+      - name: Build
+        run: cmake --build build
+      - name: Tests (fake-transport parsing + alert-engine mutation coverage)
+        run: ctest --test-dir build --output-on-failure
+      - name: Live weather fusion test (ADR-0014, real Open-Meteo round trip)
+        run: ./scripts/weather_test.sh build
