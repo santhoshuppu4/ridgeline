@@ -1,0 +1,53 @@
+# Multi-stage Dockerfile for ridgeline_gateway, built with the full set of
+# optional integrations (Kafka, Redis, DynamoDB, weather) that the
+# Terraform ECS module's task role and security groups are provisioned to
+# support. This is the image terraform/modules/ecs_gateway/variables.tf's
+# `gateway_image` variable expects -- built and pushed to ECR MANUALLY,
+# not by Terraform itself; see terraform/README.md for exactly why that
+# split exists and the commands to do it.
+#
+# NOT verified end-to-end here: this Dockerfile was written and reasoned
+# about, but never actually built in this project's development sandbox
+# (a full multi-stage build compiling gRPC/protobuf/librdkafka/etc. from
+# this base image takes real time and disk this sandbox's session budget
+# doesn't comfortably allow after everything else in this phase). Build it
+# and confirm it produces a working image before trusting it in
+# production -- see terraform/README.md's verification checklist.
+
+# ---- Build stage ----
+FROM ubuntu:24.04 AS build
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build git pkg-config \
+    libprotobuf-dev protobuf-compiler libgrpc++-dev protobuf-compiler-grpc \
+    libssl-dev libcurl4-openssl-dev nlohmann-json3-dev \
+    librdkafka-dev libhiredis-dev \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DRIDGELINE_BUILD_NET=ON \
+      -DRIDGELINE_WITH_KAFKA=ON -DRIDGELINE_WITH_REDIS=ON \
+      -DRIDGELINE_WITH_DYNAMODB=ON -DRIDGELINE_WITH_WEATHER=ON \
+    && cmake --build build --target ridgeline_gateway -j"$(nproc)"
+
+# ---- Runtime stage ----
+# A separate, minimal runtime image: the build stage's compilers and dev
+# headers have no business shipping to production -- only the gateway
+# binary and the shared libraries it actually links against at runtime.
+FROM ubuntu:24.04
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libprotobuf32t64 libgrpc++1.51t64 libssl3 libcurl4 librdkafka++1 libhiredis1.1.0 \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/build/gateway/ridgeline_gateway /usr/local/bin/ridgeline_gateway
+
+EXPOSE 50051
+
+ENTRYPOINT ["/usr/local/bin/ridgeline_gateway"]
+CMD ["--listen=0.0.0.0:50051"]

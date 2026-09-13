@@ -66,7 +66,7 @@ questions to be able to answer from memory before calling this "known."
 - [x] **Phase 4** — config reconciliation (real live rate/K-of-N changes, both agent modes) and signed OTA manifest trust (Ed25519, hand-rolled, 4 mutation tests); full binary distribution/A-B-swap/watchdog rollback scoped out explicitly
 - [x] **Phase 3-ii** — multi-tenancy (tenant identity bound to cert CN, isolation verified both ways) and per-tenant rate limiting; found and fixed the same false-gap mistake as ADR-0010, this time within a single stream
 - [x] **Phase 5-i** — weather fusion + alert engine: injectable-transport weather client (8 tests, no network needed), pure-function alert severity with mutation-tested escalation logic (14 tests), graceful degradation verified in a real running gateway against a genuinely unreachable API
-- [ ] **Phase 5-ii** — Terraform on AWS
+- [x] **Phase 5-ii** — Terraform for AWS (VPC, DynamoDB, ElastiCache, MSK Serverless, S3, ECS Fargate); validated with terraform-config-inspect + manual cross-reference (real terraform binary unreachable from this sandbox, never applied against real AWS); found a real gap -- KafkaProducer has no IAM SASL support needed for MSK Serverless
 
 ## Phase 1b-ii: real inference (optional build)
 
@@ -237,6 +237,23 @@ so it's written to run in CI (GitHub Actions runners have normal internet
 access) or on your own machine, not here. See
 `context/adr/0014-weather-fusion-and-alert-engine.md` for the full split
 between what's verified here and what needs real infrastructure.
+
+## Phase 5-ii: Terraform for AWS
+
+```bash
+cd terraform
+terraform init
+terraform plan -var="gateway_image=<your-ecr-image-uri>"
+terraform apply -var="gateway_image=..."
+```
+
+See `terraform/README.md` for the full workflow (building/pushing the
+gateway image first, finding the deployed gateway's address, tearing
+down) and `context/adr/0015-terraform-aws-infrastructure.md` for what was
+and wasn't verified, including a real integration gap: the existing
+`KafkaProducer` has no AWS IAM SASL support, which MSK Serverless
+requires -- named explicitly rather than left for whoever connects the
+two first.
 
 ## Honesty notes
 
