@@ -255,10 +255,15 @@ and wasn't verified, including a real integration gap: the existing
 requires -- named explicitly rather than left for whoever connects the
 two first.
 
+## Live demo
+
+A real, running slice of this project -- the actual AlertEngine/WeatherClient
+code, live in AWS Lambda, at zero guaranteed cost. See `demo/README.md`
+for the full deploy workflow and `context/adr/0016-live-demo.md` for what
+was and wasn't verified from this sandbox.
+
 ## Honesty notes
 
 Performance numbers live in `BENCHMARKS.md` with hardware, commit, and
-method. Fleet-scale claims are backed by `ridgeline_device_simulator`
-(Phase 2) — 500 simulated devices, verified on real hardware, with the
-run's own thread-count and throughput numbers recorded in
-`BENCHMARKS.md`, not just asserted here.
+method. Nothing here claims fleet scale — the device simulator that would
+justify that doesn't exist yet.

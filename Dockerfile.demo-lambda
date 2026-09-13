@@ -1,0 +1,65 @@
+# Multi-stage Dockerfile for the live-demo Lambda (demo/lambda/), packaging
+# real project code -- ridgeline_weather, ridgeline_dynamodb, ridgeline_demo_core
+# -- as an AWS Lambda container image.
+#
+# BUILT ON amazonlinux:2023 SPECIFICALLY: AWS's own custom-runtime Lambda
+# base image (public.ecr.aws/lambda/provided:al2023) IS Amazon Linux 2023.
+# Building anywhere else (e.g. Ubuntu, this project's usual dev base) risks
+# a glibc/libstdc++ version mismatch between build and runtime environments
+# -- a binary built against a newer glibc than the Lambda execution
+# environment ships will fail to even start, not just misbehave.
+#
+# NOT verified end-to-end here: `docker build` needs a Docker daemon, which
+# this project's development sandbox doesn't have, and pulling
+# amazonlinux:2023 / public.ecr.aws base images isn't reachable from here
+# either. What WAS verified directly, in this sandbox: the actual handler
+# binary (demo/lambda/src/handler.cc) compiles and links successfully
+# against the real aws-lambda-cpp library -- this Dockerfile's only job is
+# correctly packaging that already-proven binary, not re-deriving whether
+# the C++ code itself is correct.
+
+# ---- Build stage ----
+FROM amazonlinux:2023 AS build
+
+RUN dnf install -y gcc-c++ cmake make git libcurl-devel openssl-devel tar gzip \
+  && dnf clean all
+
+# aws-lambda-cpp: the real, official AWS runtime interface client for C++
+# Lambda functions -- not a reimplementation of the Lambda Runtime API.
+RUN git clone --depth 1 https://github.com/awslabs/aws-lambda-cpp.git /opt/aws-lambda-cpp \
+  && cmake -S /opt/aws-lambda-cpp -B /opt/aws-lambda-cpp/build -DCMAKE_BUILD_TYPE=Release -DENABLE_LTO=OFF \
+  && cmake --build /opt/aws-lambda-cpp/build -j"$(nproc)" \
+  && cmake --install /opt/aws-lambda-cpp/build --prefix /opt/aws-lambda-cpp/install
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRIDGELINE_BUILD_NET=OFF \
+      -DRIDGELINE_WITH_WEATHER=ON -DRIDGELINE_WITH_DYNAMODB=ON -DRIDGELINE_WITH_DEMO=ON \
+    && cmake --build build --target ridgeline_demo_core -j"$(nproc)"
+
+RUN g++ -std=c++20 -O2 -c demo/lambda/src/handler.cc \
+      -I demo/lambda/include -I weather/include -I dynamodb/include -I core/include \
+      -I /opt/aws-lambda-cpp/install/include \
+      -o /tmp/handler.o \
+    && g++ -std=c++20 /tmp/handler.o \
+      build/demo/lambda/libridgeline_demo_core.a build/weather/libridgeline_weather.a \
+      build/dynamodb/libridgeline_dynamodb.a build/core/libridgeline_core.a \
+      /opt/aws-lambda-cpp/install/lib64/libaws-lambda-runtime.a \
+      -lcurl -lcrypto -o /tmp/ridgeline_demo_handler
+
+# ---- Runtime stage ----
+# AWS's own base for container-packaged Lambda functions using a custom
+# (non-managed) runtime -- this base's ENTRYPOINT already expects exactly
+# what aws-lambda-cpp's run_handler() provides: a long-running process that
+# polls the Lambda Runtime API itself, rather than a request-per-process
+# model. No extra runtime shim is needed here for that reason.
+FROM public.ecr.aws/lambda/provided:al2023
+
+COPY --from=build /tmp/ridgeline_demo_handler /var/runtime/ridgeline_demo_handler
+# Shared libraries the binary links against dynamically -- copied
+# explicitly rather than relying on the base image happening to already
+# have matching versions installed.
+COPY --from=build /usr/lib64/libcurl.so.4 /usr/lib64/libssl.so.3 /usr/lib64/libcrypto.so.3 /usr/lib64/
+
+ENTRYPOINT ["/var/runtime/ridgeline_demo_handler"]
