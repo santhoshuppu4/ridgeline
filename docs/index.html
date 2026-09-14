@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ridgeline — Live Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 780px; margin: 2rem auto; padding: 0 1rem; background: #0d1117; color: #c9d1d9; }
+  h1 { font-size: 1.4rem; }
+  p.sub { color: #8b949e; margin-top: -0.5rem; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  .row { display: flex; align-items: center; gap: 0.75rem; }
+  input[type=range] { flex: 1; }
+  button { background: #238636; color: white; border: none; border-radius: 6px; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.95rem; }
+  button:disabled { background: #30363d; cursor: default; }
+  .events { display: flex; flex-direction: column; gap: 0.5rem; max-height: 400px; overflow-y: auto; }
+  .event { display: flex; justify-content: space-between; padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.85rem; border-left: 4px solid #30363d; }
+  .sev-none { border-left-color: #30363d; }
+  .sev-low { border-left-color: #58a6ff; }
+  .sev-medium { border-left-color: #d29922; }
+  .sev-high { border-left-color: #f0883e; }
+  .sev-critical { border-left-color: #f85149; }
+  .sev-label { text-transform: uppercase; font-weight: 600; font-size: 0.75rem; }
+  a { color: #58a6ff; }
+  .foot { color: #6e7681; font-size: 0.8rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+  <h1>Ridgeline — live demo</h1>
+  <p class="sub">Real compiled C++ running in AWS Lambda — the actual <code>AlertEngine</code> and
+     <code>WeatherClient</code> from the project, fusing a confidence value with live weather.
+     <a href="https://github.com/santhoshuppu4/ridgeline" target="_blank">Source</a>.</p>
+
+  <div class="card">
+    <h3>Try it yourself</h3>
+    <p class="sub">Pick a detection confidence and see it fused with the current live weather at Los Angeles.</p>
+    <div class="row">
+      <span>Confidence:</span>
+      <input type="range" id="confidence" min="0" max="1" step="0.05" value="0.7">
+      <span id="confidence-value">0.70</span>
+    </div>
+    <br>
+    <button id="trigger-btn" onclick="triggerDemo()">Compute severity</button>
+    <div id="trigger-result" style="margin-top: 0.75rem;"></div>
+  </div>
+
+  <div class="card">
+    <h3>Live feed</h3>
+    <p class="sub">Synthetic detections generated on a schedule, plus anything triggered above — polled every 10s.</p>
+    <div class="events" id="events"></div>
+  </div>
+
+  <p class="foot">Not billed for real-time inference at scale — this demo intentionally exercises the alert-fusion
+    logic (ADR-0014), not the full ONNX detection pipeline, to stay within AWS's free tier indefinitely.</p>
+
+<script>
+  // Set this to your deployed API Gateway endpoint (terraform output api_endpoint).
+  const API_BASE = "https://p1ztj5fzk4.execute-api.us-west-2.amazonaws.com";
+
+  const confSlider = document.getElementById("confidence");
+  const confValue = document.getElementById("confidence-value");
+  confSlider.oninput = () => { confValue.textContent = parseFloat(confSlider.value).toFixed(2); };
+
+  async function triggerDemo() {
+    const btn = document.getElementById("trigger-btn");
+    const resultEl = document.getElementById("trigger-result");
+    btn.disabled = true;
+    resultEl.textContent = "Computing...";
+    try {
+      const resp = await fetch(`${API_BASE}/trigger`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confidence: parseFloat(confSlider.value) })
+      });
+      const data = await resp.json();
+      resultEl.innerHTML = `<b>Severity: ${data.severity.toUpperCase()}</b><br>` +
+        (data.weather_available
+          ? `Live weather: ${data.temperature_c}°C, ${data.relative_humidity_pct}% humidity, ${data.wind_speed_kmh} km/h wind`
+          : `Weather unavailable — severity computed from confidence alone (this is the graceful-degradation path from ADR-0014)`);
+      loadEvents();
+    } catch (e) {
+      resultEl.textContent = "Request failed — the demo may be cold-starting, try again in a few seconds.";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function loadEvents() {
+    try {
+      const resp = await fetch(`${API_BASE}/events`);
+      const data = await resp.json();
+      const container = document.getElementById("events");
+      container.innerHTML = "";
+      for (const e of data.events) {
+        const div = document.createElement("div");
+        div.className = `event sev-${e.severity}`;
+        const time = new Date(e.timestamp_unix_ns / 1e6).toLocaleTimeString();
+        div.innerHTML = `<span>${time} — confidence ${e.confidence.toFixed(2)} ${e.user_triggered ? "(you)" : "(scheduled)"}</span>` +
+          `<span class="sev-label">${e.severity}</span>`;
+        container.appendChild(div);
+      }
+    } catch (e) { /* Silent: a transient poll failure shouldn't disrupt the page. */ }
+  }
+
+  loadEvents();
+  setInterval(loadEvents, 10000);
+</script>
+</body>
+</html>
