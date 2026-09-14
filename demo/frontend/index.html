@@ -26,10 +26,23 @@
 </style>
 </head>
 <body>
-  <h1>Ridgeline — live demo</h1>
-  <p class="sub">Real compiled C++ running in AWS Lambda — the actual <code>AlertEngine</code> and
-     <code>WeatherClient</code> from the project, fusing a confidence value with live weather.
-     <a href="https://github.com/santhoshuppu4/ridgeline" target="_blank">Source</a>.</p>
+  <h1>Ridgeline</h1>
+  <p class="sub">A distributed edge-vision pipeline for early wildfire smoke detection — devices run
+     real-time inference, confirm detections across frames, and stream them through a durable,
+     crash-safe backend. <a href="https://github.com/santhoshuppu4/ridgeline" target="_blank">Full source
+     and design docs here</a>.</p>
+
+  <div class="card">
+    <h3>What's actually running on this page</h3>
+    <p class="sub">This isn't a mockup. Below is one real piece of the system — the <b>alert fusion
+       logic</b> that turns a detection into a prioritized alert — running as compiled C++ in a live
+       AWS Lambda function, fed by genuinely live weather data. The same detection confidence means
+       something very different on a calm day versus during high wind and low humidity, the exact
+       conditions under which fire spreads fastest; this is the code that makes that call.</p>
+    <p class="sub" style="margin-bottom:0;">The full pipeline also includes real-time ONNX inference,
+       mutual-TLS device identity, Kafka-backed durable delivery, and more — kept out of this public
+       page specifically so it can run live, for free, indefinitely (see the note at the bottom).</p>
+  </div>
 
   <div class="card">
     <h3>Try it yourself</h3>
